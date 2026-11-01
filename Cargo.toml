@@ -1,0 +1,55 @@
+[package]
+name = "Qllama"
+version = "0.1.0"
+edition = "2021"
+authors = ["Qllama Team"]
+description = "A Rust-native LLM inference engine inspired by llama.cpp"
+license = "MIT"
+repository = "https://github.com/your-repo/Qllama"
+keywords = ["llm", "inference", "transformer", "gguf"]
+categories = ["science", "algorithms"]
+
+[lib]
+name = "qllama"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qllama"
+path = "src/main.rs"
+
+[dependencies]
+# 并行计算
+rayon = "1.10"
+
+# 内存映射
+memmap2 = "0.9"
+
+# 序列化（用于配置文件）
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# 错误处理
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# 数值计算辅助
+num-traits = "0.2"
+
+[dev-dependencies]
+# 属性测试
+proptest = "1.5"
+
+# 基准测试
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

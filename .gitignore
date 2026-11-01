@@ -1,0 +1,27 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+*.gguf
+*.bin
+models/
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+temp/
