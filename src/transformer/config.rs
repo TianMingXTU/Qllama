@@ -4,8 +4,6 @@ use crate::gguf::{
     read_dimension, read_optional_dimension, read_positive_f32, GgufFile, GgufValue,
 };
 
-/// llama.cpp 在缺失 `attention.layer_norm_rms_epsilon` 时使用的默认值。
-const DEFAULT_RMS_NORM_EPS: f32 = 1e-5;
 /// llama.cpp 在缺失 `rope.freq_base` 时使用的默认值。
 const DEFAULT_ROPE_THETA: f32 = 10_000.0;
 
@@ -67,9 +65,9 @@ impl TransformerConfig {
     /// 一致。`vocab_size` 取自 `token_embd.weight` 的实际形状而非
     /// `tokenizer.ggml.tokens` 的长度：权重才是形状的唯一真相。
     ///
-    /// 三个可选键缺失时取 llama.cpp 的默认值：`attention.head_count_kv`
-    /// （缺失即多头注意力，等于 `attention.head_count`）、
-    /// `attention.layer_norm_rms_epsilon`、`rope.freq_base`。
+    /// `attention.layer_norm_rms_epsilon` 必须显式提供且为有限正数。
+    /// 两个可选键缺失时取 llama.cpp 的默认值：`attention.head_count_kv`
+    /// （缺失即多头注意力，等于 `attention.head_count`）和 `rope.freq_base`。
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, String> {
         let metadata = &gguf.metadata;
         let architecture = match metadata.get("general.architecture") {
@@ -143,13 +141,8 @@ impl TransformerConfig {
             }
         }
 
-        // 可选浮点参数：键缺失取 llama.cpp 默认值，存在则必须通过有限正数校验。
-        let eps_key = key("attention.layer_norm_rms_epsilon");
-        let rms_norm_eps = if metadata.contains_key(&eps_key) {
-            read_positive_f32(metadata, &eps_key)?
-        } else {
-            DEFAULT_RMS_NORM_EPS
-        };
+        let rms_norm_eps = read_positive_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?;
+        // RoPE 频率基准缺失时取默认值，存在则必须通过有限正数校验。
         let theta_key = key("rope.freq_base");
         let rope_theta = if metadata.contains_key(&theta_key) {
             read_positive_f32(metadata, &theta_key)?

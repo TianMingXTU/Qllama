@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use qllama::gguf::GgufFile;
-use qllama::transformer::Transformer;
+use qllama::transformer::{Transformer, TransformerConfig};
 
 /// 仓库内的微型 Llama 夹具，`CARGO_MANIFEST_DIR` 保证从任意工作目录都能定位。
 fn fixture_path() -> PathBuf {
@@ -47,6 +47,88 @@ fn from_gguf_reads_the_llama_configuration_from_metadata() {
     assert_eq!(config.rms_norm_eps, 1e-6);
     assert_eq!(config.rope_theta, 10000.0);
     assert_eq!(config.head_dim(), 4);
+}
+
+#[test]
+fn config_from_gguf_requires_rms_norm_epsilon() {
+    let model = model_with(|builder| {
+        builder.without_metadata("llama.attention.layer_norm_rms_epsilon");
+    });
+    let error = TransformerConfig::from_gguf(&model).expect_err("缺少 RMSNorm epsilon 时应报错");
+    assert!(
+        error.contains("llama.attention.layer_norm_rms_epsilon"),
+        "错误信息应指出缺失的 epsilon 键，实得: {error}"
+    );
+}
+
+#[test]
+fn from_gguf_requires_rms_norm_epsilon() {
+    let model = model_with(|builder| {
+        builder.without_metadata("llama.attention.layer_norm_rms_epsilon");
+    });
+    let error = Transformer::from_gguf(&model)
+        .err()
+        .expect("缺少 RMSNorm epsilon 时应拒绝加载");
+    assert!(
+        error.contains("llama.attention.layer_norm_rms_epsilon"),
+        "错误信息应指出缺失的 epsilon 键，实得: {error}"
+    );
+}
+
+#[test]
+fn from_gguf_preserves_explicit_epsilon_with_optional_defaults() {
+    let model = model_with(|builder| {
+        builder
+            .set("llama.attention.layer_norm_rms_epsilon", Value::F32(2e-5))
+            .without_metadata("llama.attention.head_count_kv")
+            .without_metadata("llama.rope.freq_base");
+        // 缺省 KV 头数表示 MHA，K/V 投影也必须扩展到与 Q 相同的输出维度。
+        for (name, dims) in &mut builder.tensors {
+            if name.ends_with(".attn_k.weight") || name.ends_with(".attn_v.weight") {
+                dims[1] = u64::from(N_EMBD);
+            }
+        }
+    });
+    let config = TransformerConfig::from_gguf(&model).expect("可选字段缺失时应采用默认值");
+    assert_eq!(config.num_kv_heads, N_HEAD as usize);
+    assert_eq!(config.rope_theta, 10_000.0);
+    assert_eq!(config.rms_norm_eps, 2e-5);
+
+    let transformer = Transformer::from_gguf(&model).expect("默认配置应能装配完整模型");
+    assert_eq!(transformer.config().num_kv_heads, N_HEAD as usize);
+    assert_eq!(transformer.config().rope_theta, 10_000.0);
+    assert_eq!(transformer.config().rms_norm_eps, 2e-5);
+    let logits = transformer.forward(&[1, 2], 0).expect("默认配置应能前向");
+    assert_eq!(logits.dims(), [2, VOCAB as usize]);
+    assert!(logits.data().iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn from_gguf_rejects_invalid_rms_norm_epsilon() {
+    for value in [
+        Value::Str("0.00002".to_string()),
+        Value::U32(1),
+        Value::F32(0.0),
+        Value::F32(-1.0),
+        Value::F32(f32::NAN),
+        Value::F32(f32::INFINITY),
+        Value::F32(f32::NEG_INFINITY),
+    ] {
+        let model = model_with(|builder| {
+            builder.set("llama.attention.layer_norm_rms_epsilon", value);
+        });
+        let config_error =
+            TransformerConfig::from_gguf(&model).expect_err("非法 RMSNorm epsilon 时应报错");
+        let model_error = Transformer::from_gguf(&model)
+            .err()
+            .expect("非法 RMSNorm epsilon 时应拒绝加载");
+        for error in [config_error, model_error] {
+            assert!(
+                error.contains("llama.attention.layer_norm_rms_epsilon"),
+                "错误信息应指出非法的 epsilon 键，实得: {error}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -327,6 +409,11 @@ impl MiniGguf {
             Some(entry) => entry.1 = value,
             None => self.metadata.push((key.to_string(), value)),
         }
+        self
+    }
+
+    fn without_metadata(&mut self, key: &str) -> &mut Self {
+        self.metadata.retain(|(name, _)| name != key);
         self
     }
 

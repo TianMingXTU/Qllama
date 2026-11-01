@@ -161,8 +161,8 @@ pub struct ModelMetadata {
 impl ModelMetadata {
     /// 提取 GGUF 元数据中的模型超参数。
     ///
-    /// `general.name`、`attention.head_count_kv`、`attention.layer_norm_rms_epsilon` 与
-    /// `rope.freq_base` 缺失时使用规范默认值，但这些可选字段存在却类型不符时仍报错；
+    /// `general.name`、`attention.head_count_kv` 与 `rope.freq_base` 缺失时使用默认值，
+    /// 但这些可选字段存在却类型不符时仍报错；`attention.layer_norm_rms_epsilon` 必须显式提供。
     /// 模型维度必须为正且可装入 `usize`，浮点参数必须为有限正值。
     pub fn from_gguf_metadata(metadata: &HashMap<String, GgufValue>) -> Result<Self, String> {
         let get_string = |key: &str| -> Result<String, String> {
@@ -215,10 +215,7 @@ impl ModelMetadata {
         };
 
         // 官方键名位于 attention 子命名空间，写成 layer_norm_rms_epsilon 会读不到真实模型的配置。
-        let layer_norm_eps = get_positive_f32_or_default(
-            &format!("{}attention.layer_norm_rms_epsilon", arch_prefix),
-            1e-5,
-        )?;
+        let layer_norm_eps = get_f32(&format!("{}attention.layer_norm_rms_epsilon", arch_prefix))?;
         let rope_freq_base =
             get_positive_f32_or_default(&format!("{}rope.freq_base", arch_prefix), 10000.0)?;
 

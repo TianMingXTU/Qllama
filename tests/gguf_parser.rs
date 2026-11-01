@@ -1122,7 +1122,6 @@ mod model_metadata {
         for key in [
             "general.name",
             "llama.attention.head_count_kv",
-            "llama.attention.layer_norm_rms_epsilon",
             "llama.rope.freq_base",
         ] {
             values.remove(key);
@@ -1131,7 +1130,7 @@ mod model_metadata {
             ModelMetadata::from_gguf_metadata(&values).expect("optional fields may be absent");
         assert_eq!(metadata.name, "unknown");
         assert_eq!(metadata.attention_head_count_kv, 8);
-        assert_eq!(metadata.layer_norm_eps, 1e-5);
+        assert_eq!(metadata.layer_norm_eps, 2e-5);
         assert_eq!(metadata.rope_freq_base, 10_000.0);
     }
 
@@ -1143,6 +1142,7 @@ mod model_metadata {
             "llama.embedding_length",
             "llama.block_count",
             "llama.attention.head_count",
+            "llama.attention.layer_norm_rms_epsilon",
             "tokenizer.ggml.tokens",
         ] {
             let mut values = llama_metadata();
@@ -1164,7 +1164,6 @@ mod model_metadata {
         for key in [
             "general.name",
             "llama.attention.head_count_kv",
-            "llama.attention.layer_norm_rms_epsilon",
             "llama.rope.freq_base",
         ] {
             let mut values = llama_metadata();
