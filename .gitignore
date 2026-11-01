@@ -17,6 +17,12 @@ Thumbs.db
 *.gguf
 *.bin
 models/
+# 例外：tests/fixtures 下的微型夹具是集成测试要加载的输入，必须随代码提交；
+# 权重体积只有十几 KB，与上面要挡住的真实模型文件不是一类东西。
+!tests/fixtures/*.gguf
+
+# Python（tests/fixtures/generate_tiny_llama.py 的产物）
+__pycache__/
 
 # Logs
 *.log
