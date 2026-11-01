@@ -176,42 +176,10 @@ impl ModelMetadata {
         };
 
         // 读取模型维度：无符号或非负有符号整数均可，零与越界值直接报错。
-        let get_dimension = |key: &str| -> Result<usize, String> {
-            let value = metadata
-                .get(key)
-                .and_then(|v| match v {
-                    GgufValue::Uint32(n) => Some(u64::from(*n)),
-                    GgufValue::Uint64(n) => Some(*n),
-                    GgufValue::Int32(n) => u64::try_from(*n).ok(),
-                    GgufValue::Int64(n) => u64::try_from(*n).ok(),
-                    _ => None,
-                })
-                .ok_or_else(|| format!("Missing or invalid metadata key: {}", key))?;
-            if value == 0 {
-                return Err(format!("Metadata key {} must be positive", key));
-            }
-            usize::try_from(value)
-                .map_err(|_| format!("Metadata key {} exceeds usize range: {}", key, value))
-        };
+        let get_dimension = |key: &str| read_dimension(metadata, key);
 
         // 读取浮点参数：必须为正有限值，防止 NaN/Inf 进入后续计算。
-        let get_f32 = |key: &str| -> Result<f32, String> {
-            let value = metadata
-                .get(key)
-                .and_then(|v| match v {
-                    GgufValue::Float32(f) => Some(*f),
-                    GgufValue::Float64(f) => Some(*f as f32),
-                    _ => None,
-                })
-                .ok_or_else(|| format!("Missing or invalid metadata key: {}", key))?;
-            if !value.is_finite() || value <= 0.0 {
-                return Err(format!(
-                    "Metadata key {} must be a positive finite number",
-                    key
-                ));
-            }
-            Ok(value)
-        };
+        let get_f32 = |key: &str| read_positive_f32(metadata, key);
 
         // 可选字符串：缺失时用默认值，存在但类型不符时报错。
         let get_optional_string = |key: &str| -> Result<String, String> {
@@ -283,4 +251,66 @@ impl ModelMetadata {
             vocab_size,
         })
     }
+}
+
+/// 读取一个模型维度元数据键。
+///
+/// 无符号与非负有符号整数都接受：llama.cpp 早期版本按目标平台的有符号性选择
+/// 写入类型，真实文件里两种都见过。零、负数与超出 `usize` 范围的值一律报错，
+/// 不能静默当成 0 或回绕值进入后续的形状计算。
+pub(crate) fn read_dimension(
+    metadata: &HashMap<String, GgufValue>,
+    key: &str,
+) -> Result<usize, String> {
+    let value = metadata
+        .get(key)
+        .and_then(|value| match value {
+            GgufValue::Uint32(n) => Some(u64::from(*n)),
+            GgufValue::Uint64(n) => Some(*n),
+            GgufValue::Int32(n) => u64::try_from(*n).ok(),
+            GgufValue::Int64(n) => u64::try_from(*n).ok(),
+            _ => None,
+        })
+        .ok_or_else(|| format!("Missing or invalid metadata key: {key}"))?;
+    if value == 0 {
+        return Err(format!("Metadata key {key} must be positive"));
+    }
+    usize::try_from(value).map_err(|_| format!("Metadata key {key} exceeds usize range: {value}"))
+}
+
+/// 读取一个可选的维度元数据键：键缺失返回 `None`，存在则按 [`read_dimension`] 校验。
+///
+/// "缺失"与"存在但非法"必须区分：前者走默认值，后者说明文件写坏了，不能蒙混过去。
+pub(crate) fn read_optional_dimension(
+    metadata: &HashMap<String, GgufValue>,
+    key: &str,
+) -> Result<Option<usize>, String> {
+    match metadata.get(key) {
+        None => Ok(None),
+        Some(_) => read_dimension(metadata, key).map(Some),
+    }
+}
+
+/// 读取一个浮点元数据键；必须为有限正数。
+///
+/// NaN 与无穷大一旦进入 RMSNorm 的 epsilon 或 RoPE 的频率基准，会在前向里
+/// 静默污染全部 logits，因此在入口处就要挡住。
+pub(crate) fn read_positive_f32(
+    metadata: &HashMap<String, GgufValue>,
+    key: &str,
+) -> Result<f32, String> {
+    let value = metadata
+        .get(key)
+        .and_then(|value| match value {
+            GgufValue::Float32(f) => Some(*f),
+            GgufValue::Float64(f) => Some(*f as f32),
+            _ => None,
+        })
+        .ok_or_else(|| format!("Missing or invalid metadata key: {key}"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!(
+            "Metadata key {key} must be a positive finite number"
+        ));
+    }
+    Ok(value)
 }

@@ -92,9 +92,12 @@ fn write_fixture(path: &Path) {
         ),
     ];
 
+    // token_embd.weight 的 dims 必须按 ggml 的 ne[] 顺序写，即 {n_embd, n_vocab}；
+    // 早期写成 {n_vocab, n_embd} 虽然不影响本文件的解析用例，但会让任何按
+    // llama.cpp 约定解释该文件的代码拿到错误形状。
     let mut tensors = vec![TensorSpec {
         name: "token_embd.weight".to_string(),
-        dims: vec![VOCAB as u64, N_EMBD as u64],
+        dims: vec![N_EMBD as u64, VOCAB as u64],
     }];
     for il in 0..N_LAYER {
         tensors.extend([
@@ -332,6 +335,95 @@ fn fixture_values_survive_the_wire_round_trip() {
         .expect("找不到 attn_q");
     assert_eq!(q.dims, vec![N_EMBD as u64, N_EMBD as u64]);
     assert!(gguf.find_tensor("blk.9.attn_q.weight").is_none());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn generate_and_logits_require_explicit_token_ids() {
+    // 退出码必须非零：脚本要靠它判断这次调用到底有没有跑前向。
+    let dir = fixture_dir("needs-tokens");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(&model, &["--generate", "4"]);
+    assert!(
+        !output.status.success(),
+        "--generate 缺少 --tokens 时应以非零码退出"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--tokens"),
+        "错误信息应指出缺少 --tokens: {stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rejects_an_empty_field_inside_the_token_list() {
+    // "1,,2" 静默按 [1,2] 跑，会让前向作用在与使用者所写不同的序列上。
+    let dir = fixture_dir("empty-field");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(&model, &["--tokens", "1,,2"]);
+    assert!(!output.status.success(), "空字段应以非零码退出");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("token #1 is empty"),
+        "错误信息应指出空字段的位置: {stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn info_announces_that_it_short_circuits_the_forward_pass() {
+    // --info 与推理参数同时给出时，前向和 logits 文件都不会发生，必须明说。
+    let dir = fixture_dir("info-short-circuit");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+    let logits = dir.join("never-written.txt");
+
+    let output = run_cli(
+        &model,
+        &[
+            "--info",
+            "--tokens",
+            "1,2",
+            "--logits",
+            logits.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "--info 本身应成功: {:?}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("short-circuits"),
+        "应提示 --info 短路了前向:\n{stdout}"
+    );
+    assert!(!logits.exists(), "--info 不应写入 logits 文件");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn token_list_accepts_both_commas_and_whitespace() {
+    let dir = fixture_dir("separators");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    for raw in ["1,2", "1, 2", "1 2", " 1  2 "] {
+        let stdout = stdout_of(&run_cli(&model, &["--tokens", raw, "--top-k", "1"]));
+        assert!(
+            stdout.contains("input ids: [1, 2]"),
+            "{raw:?} 应解析为 [1, 2]:\n{stdout}"
+        );
+    }
 
     fs::remove_dir_all(&dir).ok();
 }

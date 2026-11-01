@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::Path;
 
+use memmap2::Mmap;
+
 use super::types::{GgmlType, GgufHeader, GgufValue, TensorInfo};
 
 /// GGUF 规范当前版本，对应 gguf.h 的 GGUF_VERSION。
@@ -26,19 +28,30 @@ pub struct GgufFile {
     pub tensor_infos: Vec<TensorInfo>,
     /// Offset to tensor data start
     pub tensor_data_offset: u64,
+    /// 权重数据段的内存映射；仅 `from_path` 构造时存在。
+    ///
+    /// `Mmap` 独立于创建它的 `File`，句柄自身保活映射，因此无需在此额外持有文件。
+    /// 对 loader 模块可见，便于在同一父模块内拆分实现。
+    pub(super) tensor_data: Option<Mmap>,
 }
 
 impl GgufFile {
     /// Parse a GGUF file from path
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut file = File::open(path)?;
-        Self::from_reader(&mut file)
+        // 索引解析只用前几十字节，但权重加载需要整个数据段可寻址，因此映射整份文件。
+        // memmap2 在 Windows 上没有安全的 map 入口，此处 unsafe 的必要性与约束见 loader.rs。
+        let tensor_data = Some(unsafe { Mmap::map(&file)? });
+        Self::from_reader(&mut file).map(|parsed| Self {
+            tensor_data,
+            ..parsed
+        })
     }
 
     /// Parse a GGUF file from a reader
     pub fn from_reader<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
         // Read header
-        let header = Self::read_header(reader)?;
+        let header = Self::read_header(reader).map_err(|error| with_section("header", error))?;
 
         // Validate magic
         if &header.magic != b"GGUF" {
@@ -51,7 +64,8 @@ impl GgufFile {
         Self::validate_version(header.version)?;
 
         // Read metadata
-        let metadata = Self::read_metadata(reader, header.metadata_kv_count)?;
+        let metadata = Self::read_metadata(reader, header.metadata_kv_count)
+            .map_err(|error| with_section("metadata", error))?;
 
         let alignment = match metadata.get("general.alignment") {
             None => 32,
@@ -64,7 +78,8 @@ impl GgufFile {
             }
         };
 
-        let tensor_infos = Self::read_tensor_infos(reader, header.tensor_count)?;
+        let tensor_infos = Self::read_tensor_infos(reader, header.tensor_count)
+            .map_err(|error| with_section("tensor index", error))?;
 
         // 先求余数，避免已对齐的位置在上取整中发生不必要的溢出。
         let current_pos = reader.stream_position()?;
@@ -78,6 +93,8 @@ impl GgufFile {
             metadata,
             tensor_infos,
             tensor_data_offset,
+            // 读端无法映射：权重数据不在本结构内，加载张量会得到明确错误。
+            tensor_data: None,
         })
     }
 
@@ -415,4 +432,15 @@ fn read_string<R: Read>(reader: &mut R) -> io::Result<String> {
     reader.read_exact(&mut buf)?;
 
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// 给读取阶段的 io 错误补上"读到哪一段"的上下文。
+///
+/// 裸的 `failed to fill whole buffer` 无法告诉使用者文件坏在哪里；对截断或损坏的
+/// 模型文件，段名是唯一能定位问题的线索。
+fn with_section(section: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("while reading the GGUF {section}: {error}"),
+    )
 }
