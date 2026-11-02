@@ -398,7 +398,8 @@ fn invalid_configuration_is_rejected() {
 #[test]
 fn uniform_sampling_is_balanced() {
     // softmax([0, 0]) = [0.5, 0.5]。1000 次二项抽样，σ = sqrt(1000*0.5*0.5)
-    // = sqrt(250) ≈ 15.8，3σ ≈ 47.5，两边都应落在 [350, 650] 内。
+    // = sqrt(250) ≈ 15.8。断言界取 mean±150 ≈ ±9.5σ：远宽于 3σ，只拦截
+    // 系统性偏置（如概率没有归一化、随机源退化），不纠缠正常涨落。
     let mut sampler = Sampler::with_seed(config(1.0, 0, 1.0, 1.0), 2024);
     let counts = sample_counts(&mut sampler, &[0.0, 0.0], 1000);
     assert!(counts[0] > 350 && counts[0] < 650, "{counts:?}");
