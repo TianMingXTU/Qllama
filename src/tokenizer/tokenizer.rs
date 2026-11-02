@@ -503,11 +503,14 @@ fn read_string_array(
 /// 读取一个可选的 token id：缺失返回 None；存在则任何整型都接受且必须
 /// 落在词表范围内。
 ///
-/// `-1` 及其无符号回绕写法（`u32::MAX`/`u64::MAX`）视为"未设置"并返回
-/// None：llama.h 定义 `LLAMA_TOKEN_NULL = -1`，上游加载时对无效 id 告警并
-/// 禁用该特殊 token（llama-vocab.cpp L2968-2988），文件照常加载。不同写入
-/// 方对"没有该 token"的落盘写法不一（有符号 -1 或无符号回绕），统一按
-/// 哨兵对待。其余越界值仍然报错。
+/// 上游对"无该特殊 token"的落盘方式是**不写键**（官方转换器对缺失的
+/// 特殊 token 跳过写入），对应本函数的 None 分支；GGUF 规范也把这些键
+/// 定义为 uint32，没有负数约定——所以键存在但值越界仍然按文件级错误
+/// 拒绝。唯一豁免是 -1 及其无符号回绕写法（`u32::MAX`/`u64::MAX`）：
+/// llama.h 以 `LLAMA_TOKEN_NULL = -1` 表达"无此 token"，真实世界确实
+/// 存在以回绕值落盘 -1 的文件（new_id 为 uint32 时 -1 与 u32::MAX 无法
+/// 区分），把它们视为未设置可以加载这类文件，同时不放松对其他越界值
+/// 的校验。
 fn read_optional_id(
     metadata: &HashMap<String, GgufValue>,
     key: &str,

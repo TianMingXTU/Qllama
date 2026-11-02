@@ -517,6 +517,35 @@ fn prompt_is_encoded_and_generated_text_is_printed() {
 }
 
 #[test]
+fn top5_logit_summary_prints_only_when_not_sampling() {
+    // 规范（spec-cli.md）：top-5 logits 摘要仅在未采样（generate==0）时打印
+    // ——采样时惩罚系数会改变实际采到的 token，裸 argmax 展示容易误导。
+    let dir = fixture_dir("top5-summary");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let sampling = stdout_of(&run_cli(
+        &model,
+        &["--prompt", "tok5", "--generate", "2", "--temperature", "0"],
+    ));
+    assert!(
+        !sampling.contains("#0"),
+        "采样时不应打印 top-5 摘要:\n{sampling}"
+    );
+
+    let not_sampling = stdout_of(&run_cli(
+        &model,
+        &["--prompt", "tok5", "--temperature", "0"],
+    ));
+    assert!(
+        not_sampling.contains("#0") && not_sampling.contains("logit"),
+        "未采样时应保留 top-5 摘要:\n{not_sampling}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn prompt_and_tokens_are_mutually_exclusive() {
     // 两个输入来源同时给出时，"到底跑了哪段序列"变得不确定，必须拒绝。
     let dir = fixture_dir("prompt-and-tokens");
@@ -737,15 +766,20 @@ fn no_bos_flag_keeps_the_bos_token_out_of_the_prompt() {
 
 #[test]
 fn generation_stops_early_when_the_model_emits_eos() {
-    // EOS 必须终止生成。夹具的 EOS 是 id 1；用温度 0 走确定路径，
-    // 先算出贪心链是否会碰到 EOS，再断言提前停止。
-    let dir = fixture_dir("eos-stop");
-    let model = dir.join("tiny-llama.gguf");
-    write_fixture(&model);
+    // EOS 必须终止生成。仓库内 golden 夹具（tests/fixtures/tiny-llama.gguf，
+    // tok5 编码为 [0, 8]）的贪心链在温度 0 下第 43 步采到 EOS(id 1)——实测
+    // --generate 46/47 都只生成 43 个 token。请求 46 个，断言生成数严格小于
+    // 请求值且列表不含 EOS：只有提前停止分支被执行，这个断言才可能通过
+    // （此前用 --generate 8 的写法 8 步内碰不到 EOS，删掉停止逻辑测试照样
+    // 全绿，属于零覆盖）。
+    let model = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tiny-llama.gguf");
 
     let output = run_cli(
         &model,
-        &["--prompt", "tok5", "--generate", "8", "--temperature", "0"],
+        &["--prompt", "tok5", "--generate", "46", "--temperature", "0"],
     );
     assert!(output.status.success(), "退出码应为 0: {:?}", output.status);
     let stdout = stdout_of(&output);
@@ -767,12 +801,14 @@ fn generation_stops_early_when_the_model_emits_eos() {
             .map(|value| value.trim().parse::<i32>().expect("id 应可解析"))
             .collect()
     };
-    // EOS 本身不计入生成结果，因此生成数必然不超过请求的上限，且不含 EOS id。
-    assert!(ids.len() <= 8, "生成数量不应超过上限: {generated}");
+    // 提前停止的直接证据：生成数严格小于请求的上限。仅靠循环上限不可能
+    // 产生这个结果——若 EOS 停止被移除，这里会生成满 46 个并失败。
+    assert!(
+        ids.len() < 46,
+        "应在采到 EOS 时提前停止（生成数应严格小于 46）: {generated}"
+    );
     assert!(
         !ids.contains(&1),
         "EOS(id 1) 不应出现在生成结果里: {generated}"
     );
-
-    fs::remove_dir_all(&dir).ok();
 }

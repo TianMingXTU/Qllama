@@ -224,9 +224,13 @@ fn main() -> anyhow::Result<()> {
         summary.argmax
     );
 
-    // 这里固定打印前 5 个：--top-k 现在是采样参数，不再控制展示数量。
-    for (rank, (token, logit)) in top_k(last_row, 5).iter().enumerate() {
-        println!("  #{rank:<3} token {token:<8} logit {logit:.6}");
+    // 按规范仅在未采样时打印前 5 个 logits（数量固定为 5、与 --top-k 解耦，
+    // --top-k 现在是采样参数）：采样时惩罚系数会改变实际采到的 token，把
+    // 裸 argmax 展示出来容易让人误当作生成依据。
+    if args.generate == 0 {
+        for (rank, (token, logit)) in top_k(last_row, 5).iter().enumerate() {
+            println!("  #{rank:<3} token {token:<8} logit {logit:.6}");
+        }
     }
 
     if let Some(path) = &args.logits {
