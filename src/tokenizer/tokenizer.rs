@@ -184,13 +184,20 @@ impl Tokenizer {
                             ))
                         }
                     };
-                    // 从第二个字符起找空格：首字符允许是空格（上游
-                    // strchr(word + 1, ' ') 的语义）。字节下标切分安全：
-                    // find(' ') 命中的必是 ASCII 空格。
-                    let split = if word.chars().count() >= 2 {
-                        word[1..].find(' ').map(|position| position + 1)
-                    } else {
+                    // 从第二个字节起找空格，对应上游 strchr(word + 1, ' ')
+                    // 的语义：首字符允许是空格。必须按字节扫描（上游就是
+                    // 纯字节搜索）而不是 word[1..] 切片——后者要求字节 1
+                    // 恰好是字符边界，首字符是多字节 UTF-8（如 GPT-2 merges
+                    // 首行的 "Ġ t"、SPM 的 "▁a b"）时直接 panic。UTF-8 的
+                    // 续字节与首字节都不会是 0x20，因此命中的空格必在字符
+                    // 边界上，两侧切片安全。
+                    let split = if word.is_empty() {
                         None
+                    } else {
+                        word.as_bytes()[1..]
+                            .iter()
+                            .position(|&byte| byte == b' ')
+                            .map(|position| position + 1)
                     };
                     let Some(split) = split else {
                         return Err(format!(
@@ -198,7 +205,10 @@ impl Tokenizer {
                         ));
                     };
                     let pair = (word[..split].to_string(), word[split + 1..].to_string());
-                    merge_ranks.insert(pair.clone(), index);
+                    // 上游 bpe_ranks.emplace 对重复对保留首次出现的 rank
+                    // （llama-vocab.cpp L2330）；HashMap::insert 是 last-wins，
+                    // 会让同一文件的合并优先级与上游相反。
+                    merge_ranks.entry(pair.clone()).or_insert(index);
                     merges.push(pair);
                 }
             }
@@ -357,6 +367,13 @@ impl Tokenizer {
                 ids.push(id);
                 continue;
             }
+            // ⚠️ 与上游的差异：任务书要求未命中先 unk 再 byte fallback，
+            // 本实现照此执行。llama.cpp 的标准 BPE 从不输出 unk——对未命中
+            // 符号直接逐字节 fallback（llama-vocab.cpp L798-818，unk 分支
+            // 仅 SOPRANO pre-type 生效，unk 输出只存在于 SPM viterbi 路径）。
+            // "带 unk 配置 + 词表缺该符号但有 byte token" 的文件两侧结果
+            // 不同：这里得 unk，上游得 byte token 序列。若后续实现 scores
+            // 驱动的 SPM 合并，需按模型类型分派这条路径。
             if let Some(unk) = self.unk_id {
                 ids.push(unk);
                 continue;
@@ -412,11 +429,19 @@ enum Segment {
 ///
 /// 与 llama.cpp 的 `tokenizer_st_partition` 一致：按 token 文本长度降序
 /// 逐个扫描，最长匹配优先（先扫到谁谁切）。
+///
+/// 空文本的特殊 token 被跳过：`find("")` 恒命中位置 0 且零字节推进，切分
+/// 循环会永不终止。上游没有这个问题，是因为它在加载时就把空 token 改名为
+/// `[EMPTY_i]`（llama-vocab.cpp L2859-2862）；这里在收集阶段跳过，语义
+/// 等价——空 token 的文本本来就不该匹配任何内容。
 fn split_special_tokens(tokenizer: &Tokenizer, text: &str) -> Vec<Segment> {
     let mut specials: Vec<(i32, String)> = (0..tokenizer.id_to_token.len() as i32)
         .filter_map(|id| {
             let index = id as usize;
             let token_text = &tokenizer.id_to_token[index];
+            if token_text.is_empty() {
+                return None;
+            }
             tokenizer
                 .special_token_id(token_text)
                 .map(|special_id| (special_id, token_text.clone()))
@@ -477,6 +502,12 @@ fn read_string_array(
 
 /// 读取一个可选的 token id：缺失返回 None；存在则任何整型都接受且必须
 /// 落在词表范围内。
+///
+/// `-1` 及其无符号回绕写法（`u32::MAX`/`u64::MAX`）视为"未设置"并返回
+/// None：llama.h 定义 `LLAMA_TOKEN_NULL = -1`，上游加载时对无效 id 告警并
+/// 禁用该特殊 token（llama-vocab.cpp L2968-2988），文件照常加载。不同写入
+/// 方对"没有该 token"的落盘写法不一（有符号 -1 或无符号回绕），统一按
+/// 哨兵对待。其余越界值仍然报错。
 fn read_optional_id(
     metadata: &HashMap<String, GgufValue>,
     key: &str,
@@ -486,6 +517,16 @@ fn read_optional_id(
         None => return Ok(None),
         Some(value) => value,
     };
+    let is_null_sentinel = match raw {
+        GgufValue::Int32(n) => *n == -1,
+        GgufValue::Int64(n) => *n == -1,
+        GgufValue::Uint32(n) => *n == u32::MAX,
+        GgufValue::Uint64(n) => *n == u64::MAX,
+        _ => return Err(format!("Missing or invalid metadata key: {key}")),
+    };
+    if is_null_sentinel {
+        return Ok(None);
+    }
     let value: i64 = match raw {
         GgufValue::Int32(n) => i64::from(*n),
         GgufValue::Uint32(n) => i64::from(*n),
@@ -495,7 +536,7 @@ fn read_optional_id(
                 .map_err(|_| format!("Metadata key {key} is out of i32 range: {n}"))?;
             n
         }
-        _ => return Err(format!("Missing or invalid metadata key: {key}")),
+        _ => unreachable!("sentinel check above rejected non-integer values"),
     };
     if value < 0 || value >= vocab_size as i64 {
         return Err(format!(

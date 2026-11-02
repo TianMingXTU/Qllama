@@ -164,16 +164,17 @@ fn write_typed_value(w: &mut Writer, value: &GgufValue, with_type_tag: bool) {
             w.buf.push(u8::from(*flag));
         }
         GgufValue::Array(items) => {
-            // parser 顺序：array_type → count → 元素。
+            // parser 顺序：array_type → count → 元素。空数组也要写元素类型：
+            // parser 无条件先读 array_type 再读 count，漏写会让 count 的低
+            // 4 字节被当成元素类型、整个字节流从此错位（此前靠尾部零填充
+            // 巧合解析成功）。String(8) 与 parser 对空数组验证的类型一致。
             let element_type = items.first().map(|item| match item {
                 GgufValue::String(_) => META_TYPE_STRING,
                 GgufValue::Int32(_) => META_TYPE_INT32,
                 GgufValue::Int64(_) => META_TYPE_INT64,
                 other => panic!("fixture does not support array element {other:?}"),
             });
-            if let Some(type_id) = element_type {
-                w.u32(type_id);
-            }
+            w.u32(element_type.unwrap_or(META_TYPE_STRING));
             w.u64(items.len() as u64);
             for item in items {
                 write_typed_value(w, item, false);
@@ -528,6 +529,93 @@ fn merge_leading_space_is_accepted() {
     assert_eq!(tokenizer.encode("b").unwrap(), vec![1]);
 }
 
+/// merges 项首字符是多字节 UTF-8 时按字节扫描解析（上游 strchr(word+1, ' ')
+/// 语义），加载成功而不是 panic。GPT-2 家族 merges 的首行就是 "Ġ t"。
+#[test]
+fn merge_multibyte_first_char_is_accepted() {
+    let metadata: Vec<(String, GgufValue)> = vec![
+        (
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("llama".into()),
+        ),
+        (
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("Ġ".into()),
+                GgufValue::String("t".into()),
+                GgufValue::String("Ġt".into()),
+            ]),
+        ),
+        (
+            "tokenizer.ggml.merges".into(),
+            GgufValue::Array(vec![GgufValue::String("Ġ t".into())]),
+        ),
+        (
+            "tokenizer.ggml.add_space_prefix".into(),
+            GgufValue::Bool(false),
+        ),
+    ];
+    let tokenizer = Tokenizer::from_gguf(&parse(&build_gguf_bytes(&metadata))).unwrap();
+    // 切分正确：("Ġ", "t") 的 rank 生效，"Ġt" 合并成 id 2（无 bos 干扰）。
+    let ids = tokenizer
+        .encode_with_options(
+            "Ġt",
+            &EncodeOptions {
+                add_bos: false,
+                add_eos: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(ids, vec![2]);
+}
+
+/// 重复的 merges 条目按首次出现的下标取 rank（上游 bpe_ranks.emplace 的
+/// first-wins 语义）；last-wins 会让同一文件的合并顺序相反。
+#[test]
+fn duplicate_merges_keep_first_rank() {
+    let metadata: Vec<(String, GgufValue)> = vec![
+        (
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("llama".into()),
+        ),
+        (
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("a".into()),
+                GgufValue::String("b".into()),
+                GgufValue::String("c".into()),
+                GgufValue::String("ab".into()),
+                GgufValue::String("bc".into()),
+            ]),
+        ),
+        (
+            "tokenizer.ggml.merges".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("a b".into()),
+                GgufValue::String("b c".into()),
+                GgufValue::String("a b".into()),
+            ]),
+        ),
+        (
+            "tokenizer.ggml.add_space_prefix".into(),
+            GgufValue::Bool(false),
+        ),
+    ];
+    let tokenizer = Tokenizer::from_gguf(&parse(&build_gguf_bytes(&metadata))).unwrap();
+    // first-wins：rank("a","b")=0 < rank("b","c")=1，先合并 (a,b) 得 [ab,c]。
+    // 若错成 last-wins（rank=2），会先合并 (b,c) 得 [a,bc]。
+    let ids = tokenizer
+        .encode_with_options(
+            "abc",
+            &EncodeOptions {
+                add_bos: false,
+                add_eos: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(ids, vec![3, 2]);
+}
+
 /// bos/eos id 越界报错。
 #[test]
 fn out_of_range_bos_id_is_rejected() {
@@ -547,6 +635,50 @@ fn out_of_range_bos_id_is_rejected() {
         error.contains("bos_token_id") && error.contains("outside"),
         "{error}"
     );
+}
+
+/// `-1`（及无符号回绕）哨兵按 LLAMA_TOKEN_NULL 语义视为"未设置"，
+/// 文件照常加载而不是整体拒绝。
+#[test]
+fn null_sentinel_special_ids_are_treated_as_unset() {
+    for value in [
+        GgufValue::Int32(-1),
+        GgufValue::Int64(-1),
+        GgufValue::Uint32(u32::MAX),
+        GgufValue::Uint64(u64::MAX),
+    ] {
+        let metadata: Vec<(String, GgufValue)> = vec![
+            (
+                "tokenizer.ggml.model".into(),
+                GgufValue::String("llama".into()),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufValue::Array(vec![GgufValue::String("a".into())]),
+            ),
+            ("tokenizer.ggml.bos_token_id".into(), value),
+        ];
+        let tokenizer = Tokenizer::from_gguf(&parse(&build_gguf_bytes(&metadata))).unwrap();
+        assert_eq!(tokenizer.bos_id(), None);
+    }
+}
+
+/// -1 哨兵之外的负数 id 仍然报错：哨兵语义只覆盖 LLAMA_TOKEN_NULL。
+#[test]
+fn other_negative_special_ids_are_rejected() {
+    let metadata: Vec<(String, GgufValue)> = vec![
+        (
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("llama".into()),
+        ),
+        (
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![GgufValue::String("a".into())]),
+        ),
+        ("tokenizer.ggml.bos_token_id".into(), GgufValue::Int32(-2)),
+    ];
+    let error = Tokenizer::from_gguf(&parse(&build_gguf_bytes(&metadata))).unwrap_err();
+    assert!(error.contains("outside"), "{error}");
 }
 
 /// bos_token_id 用 Int32 与 Uint64 两种类型都能读（写入方类型不一致的现实兼容）。
@@ -695,6 +827,50 @@ fn unencodable_symbol_is_an_error() {
     let tokenizer = Tokenizer::from_gguf(&parse(&build_gguf_bytes(&metadata))).unwrap();
     let error = tokenizer.encode("z").unwrap_err();
     assert!(error.contains("Cannot encode"), "{error}");
+}
+
+/// 空文本的特殊 token 被跳过而不是让切分循环零推进死循环：上游在加载时
+/// 把空 token 改名 [EMPTY_i]（llama-vocab.cpp L2859-2862）规避同一问题。
+#[test]
+fn empty_special_token_does_not_hang_encoding() {
+    let metadata: Vec<(String, GgufValue)> = vec![
+        (
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("llama".into()),
+        ),
+        (
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("".into()),
+                GgufValue::String("a".into()),
+                GgufValue::String("b".into()),
+            ]),
+        ),
+        (
+            "tokenizer.ggml.token_type".into(),
+            GgufValue::Array(vec![
+                GgufValue::Int32(3),
+                GgufValue::Int32(1),
+                GgufValue::Int32(1),
+            ]),
+        ),
+        (
+            "tokenizer.ggml.add_space_prefix".into(),
+            GgufValue::Bool(false),
+        ),
+    ];
+    let tokenizer = Tokenizer::from_gguf(&parse(&build_gguf_bytes(&metadata))).unwrap();
+    // 空 token 不参与切分；"ab" 照常编码为 [a, b]。
+    let ids = tokenizer
+        .encode_with_options(
+            "ab",
+            &EncodeOptions {
+                add_bos: false,
+                add_eos: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(ids, vec![1, 2]);
 }
 
 // ---------------------------------------------------------------- decode
