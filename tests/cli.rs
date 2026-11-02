@@ -20,8 +20,10 @@ const ALIGNMENT: u64 = 32;
 enum Value {
     U32(u32),
     F32(f32),
+    Bool(bool),
     Str(String),
     Tokens(Vec<String>),
+    Ints(Vec<i32>),
 }
 
 struct TensorSpec {
@@ -30,6 +32,10 @@ struct TensorSpec {
 }
 
 fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_i32(out: &mut Vec<u8>, value: i32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -56,6 +62,10 @@ fn put_value(out: &mut Vec<u8>, value: &Value) {
             put_u32(out, 6);
             put_f32(out, *v);
         }
+        Value::Bool(v) => {
+            put_u32(out, 7);
+            out.push(u8::from(*v));
+        }
         Value::Str(v) => {
             put_u32(out, 8);
             put_string(out, v);
@@ -69,12 +79,28 @@ fn put_value(out: &mut Vec<u8>, value: &Value) {
                 put_string(out, item);
             }
         }
+        Value::Ints(items) => {
+            put_u32(out, 9);
+            put_u32(out, 5);
+            put_u64(out, items.len() as u64);
+            for item in items {
+                put_i32(out, *item);
+            }
+        }
     }
 }
 
 /// 生成一个微型 Llama 架构的 GGUF 文件。
+///
+/// `with_tokenizer` 决定是否写入分词器元数据：关掉它可以构造"模型没有分词器"
+/// 的场景，用来验证 --prompt 的报错路径是否给出了 --tokens 的逃生门。
 fn write_fixture(path: &Path) {
-    let metadata: Vec<(&str, Value)> = vec![
+    write_fixture_with(path, true);
+}
+
+/// 见 [`write_fixture`] 的 `with_tokenizer` 参数说明。
+fn write_fixture_with(path: &Path, with_tokenizer: bool) {
+    let mut metadata: Vec<(&str, Value)> = vec![
         ("general.architecture", Value::Str("llama".to_string())),
         ("general.name", Value::Str("qllama-cli-fixture".to_string())),
         ("llama.context_length", Value::U32(128)),
@@ -85,12 +111,42 @@ fn write_fixture(path: &Path) {
         ("llama.attention.head_count_kv", Value::U32(4)),
         ("llama.attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
         ("llama.rope.freq_base", Value::F32(10000.0)),
-        ("tokenizer.ggml.model", Value::Str("llama".to_string())),
-        (
-            "tokenizer.ggml.tokens",
-            Value::Tokens((0..VOCAB).map(|i| format!("tok{i}")).collect()),
-        ),
     ];
+    if with_tokenizer {
+        // 词表长度必须等于 token_embd.weight 的行数：TransformerConfig 会拒绝
+        // 两者不一致的文件。16 个槽位 = t/o/k/5 四个单字符 + to/tok/tok5 三个
+        // 合并产物 + tok7..tok15 九个占位（从 7 编号避免与链里的 tok5 重名）。
+        // merges 让 "tok5" 有确定的编码路径：t+o→to → to+k→tok → tok+5→tok5
+        // = id 6。add_space_prefix=false：词表没有 ▁，开着会把前导空格编成 unk。
+        metadata.extend([
+            ("tokenizer.ggml.model", Value::Str("llama".to_string())),
+            (
+                "tokenizer.ggml.tokens",
+                Value::Tokens(
+                    // 链符号在前（id 0..6），占位符 tok7..tok15 在后。
+                    ["t", "o", "k", "5", "to", "tok", "tok5"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .chain((7..VOCAB).map(|i| format!("tok{i}")))
+                        .collect(),
+                ),
+            ),
+            // token_type：1=NORMAL（上游 LLAMA_TOKEN_TYPE 枚举）。
+            ("tokenizer.ggml.token_type", Value::Ints(vec![1; VOCAB])),
+            (
+                "tokenizer.ggml.merges",
+                Value::Tokens(
+                    ["t o", "to k", "tok 5"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                ),
+            ),
+            ("tokenizer.ggml.bos_token_id", Value::U32(0)),
+            ("tokenizer.ggml.eos_token_id", Value::U32(1)),
+            ("tokenizer.ggml.add_space_prefix", Value::Bool(false)),
+        ]);
+    }
 
     // token_embd.weight 的 dims 必须按 ggml 的 ne[] 顺序写，即 {n_embd, n_vocab}；
     // 早期写成 {n_vocab, n_embd} 虽然不影响本文件的解析用例，但会让任何按
@@ -320,7 +376,7 @@ fn fixture_values_survive_the_wire_round_trip() {
 
     let gguf = GgufFile::from_path(&model).expect("解析夹具失败");
     assert_eq!(gguf.tensor_count(), 21);
-    assert_eq!(gguf.metadata_count(), 12);
+    assert_eq!(gguf.metadata_count(), 17);
 
     match gguf.metadata.get("tokenizer.ggml.tokens") {
         Some(GgufValue::Array(items)) => {
@@ -424,6 +480,299 @@ fn token_list_accepts_both_commas_and_whitespace() {
             "{raw:?} 应解析为 [1, 2]:\n{stdout}"
         );
     }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prompt_is_encoded_and_generated_text_is_printed() {
+    // --prompt 是文字生成闭环的主入口：文本进、token id 出、再解码回文本。
+    let dir = fixture_dir("prompt-generate");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(
+        &model,
+        &["--prompt", "tok5", "--generate", "3", "--temperature", "0"],
+    );
+    assert!(
+        output.status.success(),
+        "退出码应为 0: {:?}\n{}",
+        output.status,
+        stdout_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    // BOS(id 0) 自动加在头部；"tok5" 经 merges 链 t+o→to→tok+5 合并为 id 6。
+    assert!(
+        stdout.contains("input ids: [0, 6]"),
+        "应把 tok5 编码为 [0, 6]:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("generated 3 token(s)"),
+        "应生成 3 个 token:\n{stdout}"
+    );
+    assert!(stdout.contains("text:"), "应打印解码后的文本:\n{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prompt_and_tokens_are_mutually_exclusive() {
+    // 两个输入来源同时给出时，"到底跑了哪段序列"变得不确定，必须拒绝。
+    let dir = fixture_dir("prompt-and-tokens");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(&model, &["--prompt", "tok5", "--tokens", "1,2"]);
+    assert!(
+        !output.status.success(),
+        "--prompt 与 --tokens 同时给出应以非零码退出"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "错误信息应指出互斥: {stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn generate_without_any_input_is_rejected() {
+    let dir = fixture_dir("needs-input");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(&model, &["--generate", "2"]);
+    assert!(
+        !output.status.success(),
+        "既无 --prompt 也无 --tokens 时应以非零码退出"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--prompt") && stderr.contains("--tokens"),
+        "错误信息应指出两个可用入口: {stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prompt_on_a_model_without_tokenizer_metadata_points_at_tokens() {
+    // 模型没有分词器元数据是常见情形（量化工具可能不写 tokenizer 段），
+    // 错误信息必须给出可操作的替代方案，而不是一句 "not implemented"。
+    let dir = fixture_dir("prompt-no-tokenizer");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture_with(&model, false);
+
+    let output = run_cli(&model, &["--prompt", "tok5"]);
+    assert!(
+        !output.status.success(),
+        "缺分词器元数据时 --prompt 应以非零码退出"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--tokens"),
+        "错误信息应提示改用 --tokens: {stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_fixed_seed_makes_sampling_reproducible() {
+    // 同一 seed 必须给出同一串 token，否则脚本无法复现实验。
+    let dir = fixture_dir("seed-reproducible");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let args = ["--prompt", "tok5", "--generate", "5", "--seed", "42"];
+    let first = stdout_of(&run_cli(&model, &args));
+    let second = stdout_of(&run_cli(&model, &args));
+    assert_eq!(first, second, "同一 seed 的两次运行输出应完全一致");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn temperature_zero_is_greedy_regardless_of_the_seed() {
+    // 贪心路径不消耗随机数，换 seed 不能改变结果。
+    let dir = fixture_dir("greedy-seed");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let first = stdout_of(&run_cli(
+        &model,
+        &[
+            "--prompt",
+            "tok5",
+            "--generate",
+            "4",
+            "--temperature",
+            "0",
+            "--seed",
+            "1",
+        ],
+    ));
+    let second = stdout_of(&run_cli(
+        &model,
+        &[
+            "--prompt",
+            "tok5",
+            "--generate",
+            "4",
+            "--temperature",
+            "0",
+            "--seed",
+            "999",
+        ],
+    ));
+    let generated = |stdout: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("generated "))
+            .unwrap_or_else(|| panic!("输出缺少 generated 行:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        generated(&first),
+        generated(&second),
+        "贪心采样不应受 seed 影响"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn logits_file_holds_one_parseable_value_per_vocab_entry() {
+    let dir = fixture_dir("logits-content");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+    let logits = dir.join("logits.txt");
+
+    let output = run_cli(
+        &model,
+        &["--tokens", "1,2", "--logits", logits.to_str().unwrap()],
+    );
+    assert!(output.status.success(), "退出码应为 0: {:?}", output.status);
+    let body = fs::read_to_string(&logits).expect("读取 logits 文件失败");
+    let values: Vec<f32> = body
+        .lines()
+        .map(|line| {
+            line.parse::<f32>()
+                .unwrap_or_else(|e| panic!("无法解析 {line:?}: {e}"))
+        })
+        .collect();
+    assert_eq!(values.len(), VOCAB, "行数应等于词表大小");
+    assert!(
+        values.iter().all(|value| value.is_finite()),
+        "logits 不应含 NaN 或 Inf"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn generation_stops_at_the_requested_token_count() {
+    let dir = fixture_dir("generate-count");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(&model, &["--tokens", "2", "--generate", "4"]);
+    assert!(output.status.success(), "退出码应为 0: {:?}", output.status);
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("generated 4 token(s)"),
+        "应生成 4 个 token:\n{stdout}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn top_k_above_the_vocab_size_is_accepted() {
+    // top-k 是"至多保留 K 个"，K 大于词表大小时等价于不限制，不该报错。
+    let dir = fixture_dir("top-k-large");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(
+        &model,
+        &["--tokens", "2", "--generate", "2", "--top-k", "999"],
+    );
+    assert!(
+        output.status.success(),
+        "top-k 超过词表大小应被接受: {:?}\n{}",
+        output.status,
+        stdout_of(&output)
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn no_bos_flag_keeps_the_bos_token_out_of_the_prompt() {
+    // BOS 的有无会改变整个序列的语义，必须能从命令行控制。
+    let dir = fixture_dir("no-bos");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let with_bos = stdout_of(&run_cli(&model, &["--prompt", "tok5", "--generate", "1"]));
+    assert!(
+        with_bos.contains("input ids: [0, 6]"),
+        "默认应加上 BOS:\n{with_bos}"
+    );
+
+    let without_bos = stdout_of(&run_cli(
+        &model,
+        &["--prompt", "tok5", "--generate", "1", "--no-bos"],
+    ));
+    assert!(
+        without_bos.contains("input ids: [6]"),
+        "--no-bos 时不应加 BOS:\n{without_bos}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn generation_stops_early_when_the_model_emits_eos() {
+    // EOS 必须终止生成。夹具的 EOS 是 id 1；用温度 0 走确定路径，
+    // 先算出贪心链是否会碰到 EOS，再断言提前停止。
+    let dir = fixture_dir("eos-stop");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(
+        &model,
+        &["--prompt", "tok5", "--generate", "8", "--temperature", "0"],
+    );
+    assert!(output.status.success(), "退出码应为 0: {:?}", output.status);
+    let stdout = stdout_of(&output);
+    let generated = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("generated "))
+        .expect("输出缺少 generated 行");
+    // 解析 "generated N token(s): [a, b, c]" 里的 id 列表，逐个比对而不是
+    // 匹配子串——子串匹配会把 id 11 误判成 id 1。
+    let list = generated
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(inside, _)| inside.trim())
+        .expect("generated 行应给出 id 列表");
+    let ids: Vec<i32> = if list.is_empty() {
+        Vec::new()
+    } else {
+        list.split(',')
+            .map(|value| value.trim().parse::<i32>().expect("id 应可解析"))
+            .collect()
+    };
+    // EOS 本身不计入生成结果，因此生成数必然不超过请求的上限，且不含 EOS id。
+    assert!(ids.len() <= 8, "生成数量不应超过上限: {generated}");
+    assert!(
+        !ids.contains(&1),
+        "EOS(id 1) 不应出现在生成结果里: {generated}"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

@@ -1,6 +1,8 @@
 use clap::{CommandFactory, Parser};
 use std::path::PathBuf;
 
+use qllama::sampler::{Sampler, SamplerConfig};
+use qllama::tokenizer::{EncodeOptions, Tokenizer};
 use qllama::transformer::Transformer;
 
 /// Qllama: A Rust-native LLM inference engine
@@ -15,17 +17,52 @@ struct Args {
     #[arg(long)]
     info: bool,
 
-    /// Run a forward pass over these explicit token ids (e.g. "1,15043,29892")
+    /// Run a forward pass over these explicit token ids (e.g. "1,2,3")
+    ///
+    /// 与 --prompt 二选一。模型缺少分词器元数据时，这是唯一能用的入口。
     #[arg(long, value_name = "IDS")]
     tokens: Option<String>,
 
-    /// Greedily decode this many tokens after the prompt
-    #[arg(long, value_name = "N", default_value_t = 0)]
+    /// Prompt text to encode and continue from
+    ///
+    /// 需要模型带分词器元数据（tokenizer.ggml.tokens 等）。
+    #[arg(short, long, value_name = "TEXT")]
+    prompt: Option<String>,
+
+    /// How many new tokens to generate after the prompt
+    ///
+    /// 采样生成，上限为 N；提前遇到 EOS 会更早停止。
+    #[arg(
+        long,
+        visible_alias = "max-tokens",
+        value_name = "N",
+        default_value_t = 0
+    )]
     generate: usize,
 
-    /// How many of the highest logits to print for the last position
-    #[arg(long, value_name = "N", default_value_t = 5)]
+    /// Sampling temperature; 0 means greedy
+    #[arg(long, value_name = "F", default_value_t = 0.8)]
+    temperature: f32,
+
+    /// Keep only the K highest-probability tokens when sampling; 0 disables the limit
+    #[arg(long, value_name = "N", default_value_t = 40)]
     top_k: usize,
+
+    /// Nucleus sampling cutoff; 1.0 disables the limit
+    #[arg(long, value_name = "F", default_value_t = 0.95)]
+    top_p: f32,
+
+    /// Penalty applied to tokens that already appeared in the context
+    #[arg(long, value_name = "F", default_value_t = 1.1)]
+    repeat_penalty: f32,
+
+    /// Seed for the sampling RNG; makes the output reproducible
+    #[arg(long, value_name = "SEED")]
+    seed: Option<u64>,
+
+    /// Do not prepend the BOS token to the encoded prompt
+    #[arg(long)]
+    no_bos: bool,
 
     /// Write the last position's logits to this file, one per line, token id order
     #[arg(long, value_name = "PATH")]
@@ -34,13 +71,6 @@ struct Args {
     /// Print only the inference result, skipping the model dump
     #[arg(short, long)]
     quiet: bool,
-
-    /// Prompt text
-    ///
-    /// 分词器实现之前它只会报错。从 --help 里隐藏，是为了不向使用者宣传一个
-    /// 必然失败的入口；保留参数本身则是为了在真的传进来时给出可操作的提示。
-    #[arg(short, long, hide = true)]
-    prompt: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,10 +85,19 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // --generate/--logits 离开 --tokens 就没有意义。返回非零而不是打印提示后
+    // --prompt 与 --tokens 是同一个输入的两个来源，同时给出会让"到底跑了哪段
+    // 序列"变得不确定，因此直接拒绝而不是挑一个执行。
+    if args.prompt.is_some() && args.tokens.is_some() {
+        anyhow::bail!("--prompt and --tokens are mutually exclusive; pass exactly one");
+    }
+
+    // --generate/--logits 离开输入就没有意义。返回非零而不是打印提示后
     // 退出 0，否则脚本无法从退出码判断这次调用是否真的做了事。
-    if args.tokens.is_none() && (args.generate > 0 || args.logits.is_some()) {
-        anyhow::bail!("--generate and --logits require --tokens <IDS>");
+    if args.prompt.is_none()
+        && args.tokens.is_none()
+        && (args.generate > 0 || args.logits.is_some())
+    {
+        anyhow::bail!("--generate and --logits require --prompt <TEXT> or --tokens <IDS>");
     }
 
     let verbose = !args.quiet;
@@ -78,7 +117,11 @@ fn main() -> anyhow::Result<()> {
     if args.info {
         // --info 会短路，后面请求的前向与 logits 文件都不会发生；静默忽略会让
         // 使用者以为已经跑过。这里明说，退出码仍为 0（--info 本身成功了）。
-        if args.tokens.is_some() || args.generate > 0 || args.logits.is_some() {
+        if args.tokens.is_some()
+            || args.prompt.is_some()
+            || args.generate > 0
+            || args.logits.is_some()
+        {
             println!(
                 "\n--info short-circuits: no forward pass was run and no logits file was written."
             );
@@ -87,23 +130,46 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // 分词器尚未实现，--prompt 只能明确报错；静默忽略会让使用者以为跑过了。
-    if let Some(prompt) = &args.prompt {
-        anyhow::bail!(
-            "Tokenizer is not implemented yet, so --prompt {prompt:?} cannot be encoded. \
-             Pass explicit token ids instead, e.g. --tokens 1,15043,29892"
-        );
-    }
-
-    let Some(tokens) = &args.tokens else {
-        println!("\nNothing to run. Pass --tokens 1,2,3 to run a forward pass.");
-        return Ok(());
+    // 分词器只在需要把文本变成 id 时才加载：--tokens 路径不需要它，模型缺少
+    // 分词器元数据时也不该阻断显式 id 的用法。
+    let mut tokenizer = None;
+    let prompt_ids = match (&args.prompt, &args.tokens) {
+        (Some(prompt), None) => {
+            let loaded = Tokenizer::from_gguf(&gguf).map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot encode --prompt {prompt:?}: {error}. \
+                     The model has no usable tokenizer metadata; \
+                     pass explicit token ids instead, e.g. --tokens 1,2,3"
+                )
+            })?;
+            let options = EncodeOptions {
+                add_bos: !args.no_bos,
+                add_eos: false,
+            };
+            let ids = loaded
+                .encode_with_options(prompt, &options)
+                .map_err(anyhow::Error::msg)?;
+            if ids.is_empty() {
+                anyhow::bail!("--prompt {prompt:?} encodes to no tokens");
+            }
+            tokenizer = Some(loaded);
+            ids
+        }
+        (None, Some(tokens)) => {
+            let ids = parse_tokens(tokens)?;
+            if ids.is_empty() {
+                anyhow::bail!("--tokens is empty; at least one token id is required");
+            }
+            ids
+        }
+        (None, None) => {
+            println!(
+                "\nNothing to run. Pass --prompt \"some text\" or --tokens 1,2,3 to run a forward pass."
+            );
+            return Ok(());
+        }
+        (Some(_), Some(_)) => unreachable!("互斥检查已在上游完成"),
     };
-
-    let prompt_ids = parse_tokens(tokens)?;
-    if prompt_ids.is_empty() {
-        anyhow::bail!("--tokens is empty; at least one token id is required");
-    }
 
     // 库接口统一用 Result<_, String> 传错误，而 anyhow 不为 String 实现 From，
     // 因此在 CLI 边界集中转换一次。
@@ -139,9 +205,14 @@ fn main() -> anyhow::Result<()> {
     let (last_row, shape) = last_position_row(&logits)?;
     println!("\n=== Forward ===");
     println!("  input ids: {prompt_ids:?}");
+    if let Some(tokenizer) = &tokenizer {
+        let text = tokenizer.decode(&prompt_ids).map_err(anyhow::Error::msg)?;
+        println!("  input text: {text:?}");
+    } else {
+        // 没有分词器时下面出现的都是 token id 而不是文本；明说一句，避免把 id 当成输出。
+        println!("  (no tokenizer metadata in this model; token ids, not text)");
+    }
     println!("  logits shape: {shape:?}");
-    // 分词器未实现，下面出现的都是 token id 而不是文本；明说一句，避免把 id 当成输出。
-    println!("  (tokenizer not implemented yet; token ids, not text)");
 
     let summary = logit_summary(last_row);
     println!(
@@ -153,7 +224,8 @@ fn main() -> anyhow::Result<()> {
         summary.argmax
     );
 
-    for (rank, (token, logit)) in top_k(last_row, args.top_k).iter().enumerate() {
+    // 这里固定打印前 5 个：--top-k 现在是采样参数，不再控制展示数量。
+    for (rank, (token, logit)) in top_k(last_row, 5).iter().enumerate() {
         println!("  #{rank:<3} token {token:<8} logit {logit:.6}");
     }
 
@@ -172,9 +244,26 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.generate > 0 {
-        let generated = greedy_decode(&model, &prompt_ids, args.generate)?;
-        println!("\n=== Greedy generation ===");
+        let sampler_config = SamplerConfig {
+            temperature: args.temperature,
+            top_k: args.top_k,
+            top_p: args.top_p,
+            repeat_penalty: args.repeat_penalty,
+        };
+        let mut sampler = match args.seed {
+            Some(seed) => Sampler::with_seed(sampler_config, seed),
+            None => Sampler::new(sampler_config),
+        };
+        // 只有 --prompt 路径才有分词器，也就才知道 EOS 是哪个 id。
+        let eos_id = tokenizer.as_ref().and_then(Tokenizer::eos_id);
+        let generated = generate(&model, &mut sampler, &prompt_ids, args.generate, eos_id)?;
+        println!("\n=== Generation ===");
+        println!("  prompt ids: {prompt_ids:?}");
         println!("  generated {} token(s): {generated:?}", generated.len());
+        if let Some(tokenizer) = &tokenizer {
+            let text = tokenizer.decode(&generated).map_err(anyhow::Error::msg)?;
+            println!("  text: {text:?}");
+        }
     }
 
     Ok(())
@@ -274,19 +363,33 @@ fn top_k(row: &[f32], k: usize) -> Vec<(usize, f32)> {
         .collect()
 }
 
-/// 贪心解码：每步取上一轮最后位置的 argmax 作为下一 token。
+/// 采样生成：每步用最后位置的 logits 采样一个 token，追加到序列后继续。
 ///
-/// 无 KV Cache，因此每步都重新前向整段序列，代价是 O(n²)；仅作端到端联调，
-/// 接上 KV Cache 后改为增量前向。
-fn greedy_decode(model: &Transformer, prompt: &[i32], steps: usize) -> anyhow::Result<Vec<i32>> {
+/// 无 KV Cache，因此每步都重新前向整段序列，代价是 O(n²)。这一步只作端到端
+/// 联调；接上 KV Cache 后应改为增量前向，届时 `forward(ids, 0)` 的调用形态
+/// 与这里的循环结构都要一起调整。
+///
+/// `eos_id` 给出时，遇到它立即停止且不计入生成结果——llama.cpp 同样不把 EOS
+/// 计入输出文本。`None` 表示模型没有 EOS，生成到上限为止。
+fn generate(
+    model: &Transformer,
+    sampler: &mut Sampler,
+    prompt: &[i32],
+    steps: usize,
+    eos_id: Option<i32>,
+) -> anyhow::Result<Vec<i32>> {
     let mut ids = prompt.to_vec();
     let mut generated = Vec::with_capacity(steps);
     for _ in 0..steps {
         let logits = model.forward(&ids, 0).map_err(anyhow::Error::msg)?;
         let (last_row, _) = last_position_row(&logits)?;
-        let next = logit_summary(last_row).argmax;
-        let next = i32::try_from(next)
-            .map_err(|_| anyhow::anyhow!("argmax {next} does not fit in i32"))?;
+        // context 传当前完整序列：重复惩罚要看到 prompt 里的每个 token。
+        let next = sampler
+            .sample_slice(last_row, &ids)
+            .map_err(anyhow::Error::msg)?;
+        if Some(next) == eos_id {
+            break;
+        }
         generated.push(next);
         ids.push(next);
     }

@@ -158,6 +158,11 @@ def pack_metadata_u32(value: int) -> bytes:
     return struct.pack("<II", META_TYPE_U32, value)
 
 
+def pack_metadata_bool(value: bool) -> bytes:
+    """Pack a metadata bool value."""
+    return struct.pack("<IB", META_TYPE_BOOL, 1 if value else 0)
+
+
 def pack_metadata_f32(value: float) -> bytes:
     """Pack a metadata f32 value."""
     return struct.pack("<If", META_TYPE_F32, value)
@@ -170,6 +175,8 @@ def pack_metadata_array(elem_type: int, elements: Sequence) -> bytes:
         return header + b"".join(pack_string(e) for e in elements)
     elif elem_type == META_TYPE_U32:
         return header + b"".join(struct.pack("<I", e) for e in elements)
+    elif elem_type == META_TYPE_I32:
+        return header + b"".join(struct.pack("<i", e) for e in elements)
     elif elem_type == META_TYPE_F32:
         return header + b"".join(struct.pack("<f", e) for e in elements)
     else:
@@ -221,7 +228,8 @@ def float_to_f32_bytes(values: Iterable[float]) -> bytes:
 def build_gguf() -> bytes:
     """Build the complete GGUF file as bytes."""
     metadata: list[tuple[str, bytes]] = []
-    tensor_infos: list[tuple[str, list[int], int, int]] = []  # (name, dims, type, offset)
+    # 第四项 offset 在后面统一回填，类型是 int | None。
+    tensor_infos: list[tuple[str, list[int], int, int | None]] = []  # (name, dims, type, offset)
     tensor_data_parts: list[bytes] = []
 
     # --- Metadata ---
@@ -241,9 +249,37 @@ def build_gguf() -> bytes:
     metadata.append(("llama.rope.dimension_count", pack_metadata_u32(ROPE_DIM)))
 
     # Tokenizer metadata (required by llama.cpp)
-    tokens = [f"tok{i}" for i in range(N_VOCAB)]
+    #
+    # 词表长度必须等于 token_embd.weight 的行数：TransformerConfig::from_gguf
+    # 会拒绝"词表条目数与权重行数不一致"的文件（词表与嵌入行描述的是同一个
+    # 词表，不一致时 argmax 出的 id 会映射到错误的 token）。
+    # 64 个槽位这样分配：<s>、</s> 两个特殊符；t/o/k/5 四个单字符与 to/tok/
+    # tok5 三个合并产物（配 merges 让 --prompt tok5 有确定的编码路径）；
+    # 其余 55 个填 tok6..tok60 占位（从 6 编号避免与链里的 tok5 重名）。
+    # tok5 的 id 是 8。
+    tokens = (
+        ["<s>", "</s>", "t", "o", "k", "5", "to", "tok", "tok5"]
+        + [f"tok{i}" for i in range(6, 61)]
+    )
     metadata.append(("tokenizer.ggml.tokens", pack_metadata_array(META_TYPE_STRING, tokens)))
     metadata.append(("tokenizer.ggml.model", pack_metadata_string("llama")))
+    # token_type：0=UNDEFINED 1=NORMAL 2=UNKNOWN 3=CONTROL 4=USER_DEFINED
+    # 5=UNUSED 6=BYTE（上游 include/llama.h 的 LLAMA_TOKEN_TYPE 枚举）。
+    # <s> 与 </s> 是控制符，其余全是普通文本。
+    token_types = [3, 3] + [1] * (N_VOCAB - 2)
+    metadata.append(("tokenizer.ggml.token_type", pack_metadata_array(META_TYPE_I32, token_types)))
+    # merges：t+o→to → to+k→tok → tok+5→tok5，rank 顺序即合并优先级。
+    # BPE 逐级合并后 "tok5" 编码为 [8]，--prompt tok5 因此有黄金路径。
+    merges = ["t o", "to k", "tok 5"]
+    metadata.append(("tokenizer.ggml.merges", pack_metadata_array(META_TYPE_STRING, merges)))
+    metadata.append(("tokenizer.ggml.bos_token_id", pack_metadata_u32(0)))
+    metadata.append(("tokenizer.ggml.eos_token_id", pack_metadata_u32(1)))
+    metadata.append(("tokenizer.ggml.unknown_token_id", pack_metadata_u32(0)))
+    # 关闭空格前缀：词表没有 ▁（SPM 转义空格符），开着它会让 --prompt tok5
+    # 先编码出一个 unk。llama.cpp 对写明 false 的文件同样尊重该键。
+    metadata.append(
+        ("tokenizer.ggml.add_space_prefix", pack_metadata_bool(False))
+    )
 
     # Real llama.cpp / gguf-py writers emit metadata keys in sorted order
     metadata.sort(key=lambda kv: kv[0])
