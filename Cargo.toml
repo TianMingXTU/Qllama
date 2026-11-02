@@ -42,6 +42,9 @@ env_logger = "0.11"
 # 数值计算辅助
 num-traits = "0.2"
 
+# 随机采样（Sampler 的可播种随机源）
+rand = { version = "0.8", features = ["small_rng"] }
+
 [dev-dependencies]
 # 属性测试
 proptest = "1.5"
