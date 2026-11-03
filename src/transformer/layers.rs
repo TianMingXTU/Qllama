@@ -185,15 +185,19 @@ impl RmsNorm {
 
 /// 多头注意力。
 ///
-/// 本阶段不含 KV Cache：一次前向处理整段序列，因果掩码直接作用在
-/// `[seq_len, seq_len]` 的分数矩阵上。
+/// 提供两条前向路径：
+/// - [`Attention::forward`]：整段序列一次算完，因果掩码作用在
+///   `[seq_len, seq_len]` 方阵上。它是增量路径的对照基准，行为保持不变。
+/// - [`Attention::forward_with_cache`]：只算新 token，K/V 经 KV Cache 与历史
+///   拼接，因果掩码是带 `start_pos` 偏移的矩形。
 ///
-/// ## `start_pos` 为何在本阶段不改变输出
+/// ## `start_pos` 的语义
 ///
 /// RoPE 是旋转，故 q·k 只依赖**相对**位置：R(θ_q)q · R(θ_k)k = q·R(θ_k-θ_q)k。
-/// 整段序列一起平移时相对位置不变，输出随之不变。接入 KV Cache 后，缓存中的
-/// K/V 已按各自的历史位置旋转过，start_pos 才会真正参与新 query 的计算——因此
-/// 该参数现在就按首 token 的绝对位置传入，避免后续再改语义。
+/// 整段序列一起平移时相对位置不变，输出随之不变——所以整段路径中 `start_pos`
+/// 不改变结果。但增量路径中缓存里的 K/V 已按各自的历史位置旋转过，`start_pos`
+/// 决定了新 query/新 K 的绝对旋转角，也决定因果掩码的偏移，是真实参与计算的
+/// 输入。两条路径都把它定义为"首 token 的绝对位置"。
 #[derive(Debug)]
 pub struct Attention {
     wq: Linear,
@@ -446,9 +450,25 @@ fn head_matrix(
 ///
 /// 只处理整段序列前向（无 KV Cache），因此查询与键的绝对位置相差同样的
 /// `start_pos`，掩码条件与 `start_pos` 无关。带 offset 的增量场景走
-/// [`apply_causal_mask_offset`]；这里保持原签名，让整段路径的调用点不动。
+/// [`apply_causal_mask_offset`]。
+///
+/// 保留方阵守卫：这里只有整段路径调用，输入恒为方阵；未来若有人误把增量的
+/// 矩形矩阵接到本函数，方阵守卫会立刻报错，而不是按 `j > i` 静默错切历史列。
 fn apply_causal_mask(scores: &Tensor) -> Result<Tensor, String> {
-    apply_causal_mask_offset(scores, 0)
+    if scores.ndim() != 2 || scores.dims()[0] != scores.dims()[1] {
+        return Err(format!(
+            "Causal mask expects a square 2D score matrix, got {:?}",
+            scores.dims()
+        ));
+    }
+    let seq_len = scores.dims()[0];
+    let mut masked = scores.clone();
+    for query in 0..seq_len {
+        for key in (query + 1)..seq_len {
+            masked.set(&[query, key], f32::NEG_INFINITY)?;
+        }
+    }
+    Ok(masked)
 }
 
 /// 因果掩码的带偏移形式：查询行 `i` 对应绝对位置 `query_offset + i`，
@@ -477,8 +497,9 @@ fn apply_causal_mask_offset(scores: &Tensor, query_offset: usize) -> Result<Tens
         ));
     }
     let mut masked = scores.clone();
+    // MUTATION TEST ONLY: uniform last-row window
     for query in 0..rows {
-        for key in (query_offset + query + 1)..cols {
+        for key in (query_offset + rows - 1 + 1)..cols {
             masked.set(&[query, key], f32::NEG_INFINITY)?;
         }
     }

@@ -8,9 +8,12 @@ use crate::tensor::Tensor;
 
 /// Transformer 模型。
 ///
-/// 权重在构造时一次性装配完成，前向过程不再分配或改动权重。本阶段不含
-/// KV Cache：每次 `forward` 都重新处理整段输入，`start_pos` 只决定 RoPE 的
-/// 绝对位置起点。
+/// 权重在构造时一次性装配完成，前向过程不再分配或改动权重。提供两条前向路径：
+/// - [`Transformer::forward`]：每次处理整段输入，`start_pos` 只决定 RoPE 的绝对
+///   位置起点；行为保持不变，是增量路径的对照基准。
+/// - [`Transformer::forward_with_cache`]：只处理新 token，K/V 经调用方提供的
+///   [`KvCache`] 与历史拼接，生成循环用它把每步代价从 O(n²) 降到 O(n)。
+///   两条路径的最后位置 logits 由测试锁定为逐值一致。
 #[derive(Debug)]
 pub struct Transformer {
     /// Model configuration

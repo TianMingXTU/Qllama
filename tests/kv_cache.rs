@@ -388,3 +388,109 @@ fn cache_without_layers_reports_zero_and_rejects_access() {
         )
         .expect_err("没有层时 update 应报错");
 }
+
+#[test]
+fn clear_resets_every_layer_even_when_lengths_diverge() {
+    // 各层 current_len 可以不同（见 layers_are_independent），clear 必须逐层重置。
+    // 若退化为"只清首层"，layer 1 的旧前缀仍可被 get 读到——正是 clear 文档
+    // 承诺"stale data is unreachable"被破坏的场景。
+    let mut cache = KvCache::new(2, 8, 2, 4);
+    cache
+        .update(
+            0,
+            &staged_tensor(3, 2, 4, 0),
+            &staged_tensor(3, 2, 4, 0),
+            &[0, 1, 2],
+        )
+        .expect("layer 0 写入应成功");
+    cache
+        .update(
+            1,
+            &staged_tensor(1, 2, 4, 0),
+            &staged_tensor(1, 2, 4, 0),
+            &[0],
+        )
+        .expect("layer 1 写入应成功");
+
+    cache.clear();
+    assert_eq!(cache.seq_len(), 0);
+    cache
+        .get(0, &[0])
+        .expect_err("clear 后 layer 0 的旧数据应不可达");
+    cache
+        .get(1, &[0])
+        .expect_err("clear 后 layer 1 的旧数据应不可达");
+
+    // 两层都能从 0 重新 prefill
+    for layer in 0..2 {
+        cache
+            .update(
+                layer,
+                &staged_tensor(1, 2, 4, 0),
+                &staged_tensor(1, 2, 4, 0),
+                &[0],
+            )
+            .expect("clear 后重新写入应成功");
+    }
+    assert_eq!(cache.seq_len(), 1);
+    assert_k_at(&cache, 1, &[0], 2, 4);
+}
+
+#[test]
+fn get_returns_rows_in_request_order_and_allows_duplicates() {
+    // 行序契约：第 i 行对应 positions[i]。乱序请求若被实现排序/聚簇，
+    // 会拿到错误的行序；重复位置应返回重复行而不是去重。
+    let mut cache = KvCache::new(1, 8, 2, 4);
+    cache
+        .update(
+            0,
+            &staged_tensor(3, 2, 4, 0),
+            &staged_tensor(3, 2, 4, 0),
+            &[0, 1, 2],
+        )
+        .expect("写入应成功");
+
+    let (k, v) = cache.get(0, &[2, 0]).expect("乱序请求应成功");
+    assert_eq!(k.dims(), [2, 2, 4]);
+    // 第 0 行必须是位置 2 的数据（200 起），第 1 行是位置 0（0 起）
+    for head in 0..2 {
+        for d in 0..4 {
+            assert_eq!(k.get(&[0, head, d]), Some((200 + head * 10 + d) as f32));
+            assert_eq!(k.get(&[1, head, d]), Some((head * 10 + d) as f32));
+            assert_eq!(v.get(&[0, head, d]), Some((200 + head * 10 + d) as f32));
+        }
+    }
+
+    let (k_dup, _) = cache.get(0, &[1, 1]).expect("重复位置应成功");
+    assert_eq!(k_dup.dims(), [2, 2, 4]);
+    for head in 0..2 {
+        for d in 0..4 {
+            let expected = Some((100 + head * 10 + d) as f32);
+            assert_eq!(k_dup.get(&[0, head, d]), expected, "重复行第 0 行");
+            assert_eq!(k_dup.get(&[1, head, d]), expected, "重复行第 1 行");
+        }
+    }
+}
+
+#[test]
+fn empty_batch_update_is_a_noop() {
+    // new_len == 0 是合法空操作：不写数据、不推进 current_len、不报错。
+    // 空批会经 forward_with_cache 的 embed/注意力空路径到达这里（例如
+    // 调用方传入空 token 列表），语义必须固定，而不是靠实现恰好没崩。
+    let mut cache = KvCache::new(1, 8, 2, 4);
+    cache
+        .update(
+            0,
+            &staged_tensor(2, 2, 4, 0),
+            &staged_tensor(2, 2, 4, 0),
+            &[0, 1],
+        )
+        .expect("首批写入应成功");
+
+    let empty = staged_tensor(0, 2, 4, 0);
+    cache
+        .update(0, &empty, &empty, &[])
+        .expect("空批应作为空操作成功");
+    assert_eq!(cache.seq_len(), 2, "空批不得推进 current_len");
+    assert_k_at(&cache, 0, &[0, 1], 2, 4);
+}

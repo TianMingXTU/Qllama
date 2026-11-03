@@ -1,50 +1,49 @@
-//! KV Cache: caches and incrementally reuses the K/V tensors of each attention layer.
+//! KV Cache：缓存并增量复用各注意力层的 K/V 张量。
 //!
-//! The cache stores **already-RoPE-rotated** K and unrotated V. This convention comes from the
-//! core property of RoPE "attention only depends on relative position": the incremental
-//! path rotates the new segment before writing it in, and never re-rotates when reading it out —
-//! old K already carries the rotation for its own position, re-rotating it would add a second
-//! rotation. llama.cpp's `k_cache` follows the same convention.
+//! 缓存存的是**已施加 RoPE** 的 K 与未施加位置编码的 V。这条约定来自 RoPE 的核心
+//! 性质"注意力只依赖相对位置"：增量路径在写入前把新段旋转一次，读回时**绝不再旋转**
+//! ——旧 K 在它自己的写入时刻已经带上了对应位置的旋转，重复旋转等于叠加两份旋转。
+//! llama.cpp 的 `k_cache` 采用同一约定。
 //!
-//! Per-layer cache shape is `[max_seq_len, num_kv_heads, head_dim]`, and the KV head count
-//! follows the model's GQA grouping (for example Llama-7B has 32 query heads but only 8 KV heads,
-//! so each KV head is shared by a group of 4 query heads). Under MHA they are equal.
+//! 单层缓存形状为 `[max_seq_len, num_kv_heads, head_dim]`，头数按模型的 GQA 分组取
+//! **KV 头数**（例如 32 个 query 头共享 8 个 KV 头的配置，每组 4 个 query 头复用
+//! 同一个 KV 头；Llama-3-8B 即此配置）。MHA 模型两者相等（Llama-7B 为 32/32）。
 //!
-//! Capacity cost: layers × max_seq_len × num_kv_heads × head_dim × 2 (K+V) × 4 bytes.
-//! Llama-7B (32 layers, cap 2048) is about 2 GB, so it must be preallocated according to
-//! actual context length rather than defaulting to the max value; when generating a small amount
-//! on demand, shrinking the capacity to the prompt length + generation amount is more economical.
+//! 容量成本：layers × max_seq_len × num_kv_heads × head_dim × 2(K+V) × 4 字节。
+//! Llama-7B 规模（32 层、cap 2048、32 KV 头、head_dim 128、f32）约 2 GB；
+//! 同层数/上下文但只有 8 个 KV 头的 GQA 模型约 512 MiB。因此容量必须按实际上下文
+//! 长度预分配，不要默认取模型标称最大值；一次性小量生成时把容量缩到
+//! prompt 长度 + 生成量更经济。
 
 use crate::tensor::Tensor;
 
-/// Single layer's KV Cache
+/// 单个层的 KV Cache。
 struct KvCacheLayer {
-    /// `[max_seq_len, num_kv_heads, head_dim]`, K with RoPE already applied
+    /// `[max_seq_len, num_kv_heads, head_dim]`，已施加 RoPE 的 K
     k_cache: Tensor,
-    /// `[max_seq_len, num_kv_heads, head_dim]`, raw V, no positional encoding
+    /// `[max_seq_len, num_kv_heads, head_dim]`，原始 V，无位置编码
     v_cache: Tensor,
-    /// Number of prefix tokens already written, counting contiguously from position 0
+    /// 已写入的前缀长度，从位置 0 起连续计数
     current_len: usize,
 }
 
-/// All layers' KV Cache, each layer has an independent `current_len`
+/// 全部层的 KV Cache，各层独立维护 `current_len`。
 pub struct KvCache {
     layers: Vec<KvCacheLayer>,
     max_seq_len: usize,
-    /// KV head count (not query head count under GQA); see `new`
+    /// KV 头数（GQA 下不是 query 头数），见 `new`
     num_kv_heads: usize,
     head_dim: usize,
 }
 
 impl KvCache {
-    /// Create a KV Cache with `num_layers` layers × `[max_seq_len, num_kv_heads, head_dim]`.
+    /// 创建 `num_layers` 层 × `[max_seq_len, num_kv_heads, head_dim]` 的 KV Cache。
     ///
-    /// The meaning of `num_kv_heads` is **KV head count**, not the query head count
-    /// (`num_attention_heads`) seen in the configuration: what the cache holds is K/V.
-    /// Under GQA, passing the query head count in wastes memory (for example
-    /// 32 instead of 8, 4x overallocation) and cannot match the shape of the K written by
-    /// Attention (`[new_len, num_kv_heads, head_dim]`), causing `update` to be rejected with a shape
-    /// error. Call sites should take the value from `TransformerConfig::num_kv_heads`.
+    /// `num_kv_heads` 的语义是 **KV 头数**，不是配置里的 query 头数
+    /// （`num_attention_heads`）：cache 存的是 K/V。GQA 模型（如 32 query 头 / 8 KV 头）
+    /// 传 query 头数既浪费内存（4 倍），也无法与 Attention 写出的 K
+    /// `[new_len, num_kv_heads, head_dim]` 形状匹配，`update` 会直接以形状错误拒绝。
+    /// 调用方应取 `TransformerConfig::num_kv_heads`。
     pub fn new(
         num_layers: usize,
         max_seq_len: usize,
@@ -67,21 +66,20 @@ impl KvCache {
         }
     }
 
-    /// Batch-write the new K/V into layer `layer_idx` at the given absolute positions.
+    /// 把一批新 K/V 写入 `layer_idx` 层的指定绝对位置。
     ///
-    /// `k`/`v` must be `[new_len, num_kv_heads, head_dim]`, with head count and head_dim
-    /// matching the cache; `positions.len()` must equal `new_len`; positions start contiguously
-    /// from the layer's current `current_len`, strictly increasing with no gaps
-    /// (`positions[i] == current_len + i`), and each value must be non-negative and less than
-    /// `max_seq_len`. Out-of-range, backward, or with gaps are all errors, never silently
-    /// truncated or written to a wrapped position. Prefill (start from 0) and decode (continue
-    /// after `current_len`) are the same rule.
+    /// `k`/`v` 必须是 `[new_len, num_kv_heads, head_dim]` 且头数与 head_dim 和 cache
+    /// 一致；`positions.len()` 必须等于 `new_len`；位置从该层当前 `current_len` 起连续
+    /// 递增、无空洞（`positions[i] == current_len + i`），且每个值非负、小于
+    /// `max_seq_len`。越界、回退、跳洞一律报错，绝不静默截断或写到回绕后的位置。
+    /// prefill（从 0 起）与 decode（接在 `current_len` 后）遵循同一条规则。
     ///
-    /// `current_len` only advances after the entire batch has been written successfully
-    /// (transactional). All validation happens before any write, so a partial failure
-    /// mid-batch cannot actually occur; even if a defensive write error fires, because
-    /// `current_len` is not advanced, the garbage rows just written are outside the prefix
-    /// and forever invisible to `get`.
+    /// `new_len == 0`（空批，positions 也为空）是合法的空操作：不写任何数据，
+    /// `current_len` 不变。
+    ///
+    /// **事务性**：所有校验都在任何写入之前完成，写入不可能中途失败；`current_len`
+    /// 只在整批写完后推进。即便某个防御性写入错误被触发，由于 `current_len` 未推进，
+    /// 刚写入的残余行也落在前缀之外，对 `get` 永远不可见。
     pub fn update(
         &mut self,
         layer_idx: usize,
@@ -97,9 +95,8 @@ impl KvCache {
         }
         let layer = &mut self.layers[layer_idx];
 
-        // Shape validation: k/v must match the cache's `[_, num_kv_heads, head_dim]`.
-        // Under GQA, a cache wrongly constructed with the query head count is caught here
-        // rather than discovering shape mismatch at read time.
+        // 形状校验：k/v 必须匹配 cache 的 `[_, num_kv_heads, head_dim]`。
+        // GQA 下用 query 头数误建的 cache 会在这里被拦下，而不是读的时候才发现。
         let k_dims = k.dims();
         if k_dims.len() != 3 || k_dims[1] != self.num_kv_heads || k_dims[2] != self.head_dim {
             return Err(format!(
@@ -113,11 +110,10 @@ impl KvCache {
         }
         let new_len = k_dims[0];
 
-        // Position validation, all done before writing:
-        // - length must match new_len, otherwise the caller's intent is ambiguous
-        // - must continue from current_len (covers backward, gaps, and double-prefill)
-        // - out of [0, max_seq_len) is rejected (uses signed comparison to avoid
-        //   a negative number becoming a huge number when cast to usize)
+        // 位置校验，全部先于写入：
+        // - 长度必须与 new_len 一致，否则调用方意图不明确
+        // - 必须从 current_len 接续（同时覆盖回退、跳洞、重复 prefill）
+        // - 越界用有符号先判负，避免负数 as usize 后变成巨数
         if positions.len() != new_len {
             return Err(format!(
                 "K batch is {new_len} token(s) but got {} position(s)",
@@ -152,8 +148,8 @@ impl KvCache {
             for head in 0..self.num_kv_heads {
                 for dim in 0..self.head_dim {
                     let coords = [token, head, dim];
-                    // Shape has been validated above, coordinate reads will not fail;
-                    // an internal inconsistency is propagated as an error rather than panicking.
+                    // 形状已在前面的校验中锁定，按坐标读取不会失败；
+                    // 若出现内部不一致，报错而不是 panic。
                     let k_value = k.get(&coords).ok_or_else(|| {
                         format!("K is missing coordinate [{token}, {head}, {dim}]")
                     })?;
@@ -166,24 +162,26 @@ impl KvCache {
             }
         }
 
-        // The entire batch has been written, only now advance the length
+        // 整批写完，此时才推进长度
         if let Some(&last) = positions.last() {
             layer.current_len = layer.current_len.max(last as usize + 1);
         }
         Ok(())
     }
 
-    /// Read out the K/V at the given positions, returning
-    /// `[positions.len(), num_kv_heads, head_dim]` tensors.
+    /// 读出指定位置的 K/V，返回 `[positions.len(), num_kv_heads, head_dim]`。
     ///
-    /// Positions must fall in `[0, current_len)`: beyond the written prefix is the content of the
-    /// initial zero array, and directly feeding that K/V to attention is equivalent to
-    /// fabricating a "token attending to nothing" — so error out instead of silently returning
-    /// zeros. Empty `positions` returns a `[0, num_kv_heads, head_dim]` tensor (attention
-    /// with an empty batch is a no-op, which is valid).
+    /// 位置必须落在 `[0, current_len)`：前缀之外是初始零数组的内容，直接喂给注意力
+    /// 等同于伪造"token 什么都没关注到"的 K/V，因此报错而不是静默返回零。空
+    /// `positions` 返回 `[0, num_kv_heads, head_dim]` 空张量（空批注意力是合法的
+    /// 空操作）。
     ///
-    /// The layout is identical to the K/V obtained by the whole-sequence path's
-    /// `[seq, num_kv_heads, head_dim]` reshape, so the caller needs no special handling.
+    /// **行序契约**：返回的第 i 行对应 `positions[i]`，与请求顺序一致；允许乱序、
+    /// 允许重复位置（重复请求返回重复行）。布局与整段路径 reshape 出的
+    /// `[seq, num_kv_heads, head_dim]` 完全一致，调用方无需特殊处理。
+    ///
+    /// 性能说明：本阶段按位置逐行复制（每个位置拷 `num_kv_heads * head_dim` 个元素），
+    /// 历史读出的成本是 O(total_len) 拷贝；性能阶段可改为非连续视图避免拷贝。
     pub fn get(&self, layer_idx: usize, positions: &[i32]) -> Result<(Tensor, Tensor), String> {
         if layer_idx >= self.layers.len() {
             return Err(format!(
@@ -193,9 +191,8 @@ impl KvCache {
         }
         let layer = &self.layers[layer_idx];
 
-        // Per token read out an entire row (num_kv_heads * head_dim elements), the cache's flat
-        // layout is exactly row-major by [position, head, dim], so a contiguous slice copy
-        // per position suffices; the boundaries have been checked.
+        // 每个位置读一整行（num_kv_heads * head_dim 个元素）。cache 的扁平布局就是
+        // 按 [position, head, dim] 行主序，因此逐位置做连续切片拷贝即可；边界已校验。
         let row = self.num_kv_heads * self.head_dim;
         let mut k_data = Vec::with_capacity(positions.len() * row);
         let mut v_data = Vec::with_capacity(positions.len() * row);
@@ -231,22 +228,20 @@ impl KvCache {
         Ok((Tensor::new(k_data, dims.clone()), Tensor::new(v_data, dims)))
     }
 
-    /// Clear all layers' written prefixes, reset `current_len` to 0.
+    /// 清空所有层已写入的前缀，把 `current_len` 重置为 0。
     ///
-    /// Only the length is reset, the K/V buffer is not zeroed: after `clear`, `get` rejects
-    /// everything with the `current_len` rule, and stale data is unreachable; a subsequent
-    /// `update` will overwrite it position by position.
+    /// 只重置长度，不清零 K/V 缓冲：`clear` 之后 `get` 会按 `current_len` 规则拒绝
+    /// 全部读取，旧数据不可达；后续 `update` 会逐位置覆盖。
     pub fn clear(&mut self) {
         for layer in &mut self.layers {
             layer.current_len = 0;
         }
     }
 
-    /// Written prefix length of the first layer.
+    /// 首层已写入的前缀长度。
     ///
-    /// Under normal use each layer is updated together in the same order, so this value is
-    /// consistent across layers; using it for bounds assertions is more direct than per-layer
-    /// lookup. A cache with no layers returns 0.
+    /// 正常使用中每层按同一顺序、同一位置更新，各层该值一致；用它做边界断言比
+    /// 逐层查询更直接。没有任何层的 cache 返回 0。
     pub fn seq_len(&self) -> usize {
         self.layers.first().map(|l| l.current_len).unwrap_or(0)
     }

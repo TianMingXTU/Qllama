@@ -818,20 +818,28 @@ fn generation_stops_early_when_the_model_emits_eos() {
 
 #[test]
 fn cached_generation_matches_full_sequence_greedy() {
-    // 阶段 5 红线：--generate 现在走 KV Cache 增量路径，贪心（温度 0）下
+    // 阶段 5 红线 10：--generate 现在走 KV Cache 增量路径，贪心（温度 0）下
     // 生成的 token 序列必须与"每步重算整段序列"的旧路径逐个相同。
     //
-    // 对照基准在测试内独立重放旧循环（整段 forward + 同参数采样），
-    // CLI 二进制则跑新路径。两条路径的 logits 只差浮点末位，若增量实现
-    // 在 RoPE 重算、因果掩码偏移或 GQA 取头上任一处出错，贪心链会很快
-    // 分叉，序列不再相等。采样参数全部显式传给 CLI，避免默认值漂移。
+    // 对照基准在测试内独立重放旧循环（整段 forward + 同参数采样），CLI 二进制
+    // 则跑新路径。链长取到 EOS（43 步）：链越长，两条路径一旦有微小数值差
+    // 被放大成不同 argmax 的机会越大。
+    //
+    // **测试边界（诚实声明）**：本用例只比对 token id 序列，不比对 logits。
+    // 实测"读回后二次旋转 K"这类缺陷造成的 logits 偏差（1e-2 量级）小于
+    // 夹具的 top1-top2 间隔，贪心链可能一步不分叉——logits 级的牙在
+    // tests/transformer_forward.rs 的一致性测试里（1e-5 逐元素断言）。
+    // 同理，若 generate 被改回"每步整段 forward"，本用例因两条路径数值一致
+    // 仍会通过：它锁的是可观察输出契约（红线 10），不是实现路径本身。
     let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("tiny-llama.gguf");
-    let steps = 12;
+    // 请求 46 步；夹具贪心链第 43 步采到 EOS(id 1)，两条路径都应在此停止。
+    let steps = 46;
+    let eos_id = 1;
 
-    // 参考序列：整段前向 + 同参数贪心采样（旧 generate 的循环结构）。
+    // 参考序列：整段前向 + 同参数贪心采样（旧 generate 的循环结构，EOS 语义一致）。
     let gguf = GgufFile::from_path(&model_path).expect("读取夹具失败");
     let model = Transformer::from_gguf(&gguf).expect("加载模型失败");
     let tokenizer = Tokenizer::from_gguf(&gguf).expect("加载分词器失败");
@@ -848,7 +856,10 @@ fn cached_generation_matches_full_sequence_greedy() {
         temperature: 0.0,
         top_k: 0,
         top_p: 1.0,
-        repeat_penalty: 1.0,
+        // 与 CLI 显式传参一致。注意重复惩罚会改变贪心 argmax：1.0（无惩罚）
+        // 时该夹具的贪心链 46 步内碰不到 EOS，只有 1.1 才复现 golden 记录的
+        // 第 43 步 EOS 链。
+        repeat_penalty: 1.1,
     };
     let mut sampler = Sampler::new(sampler_config);
     let mut ids = prompt.clone();
@@ -857,9 +868,19 @@ fn cached_generation_matches_full_sequence_greedy() {
         let logits = model.forward(&ids, 0).expect("整段前向失败");
         let columns = logits.dims()[1];
         let last = &logits.data()[(ids.len() - 1) * columns..ids.len() * columns];
-        expected.push(sampler.sample_slice(last, &ids).expect("采样失败"));
-        ids.push(*expected.last().expect("刚推进过一个 token"));
+        let next = sampler.sample_slice(last, &ids).expect("采样失败");
+        if next == eos_id {
+            break;
+        }
+        expected.push(next);
+        ids.push(next);
     }
+    // 参考链本身必须真的提前停止，否则本用例退化成"跑满步数"的弱对照
+    assert!(
+        expected.len() < steps,
+        "参考整段循环应在 {steps} 步内采到 EOS，实际生成 {} 个",
+        expected.len()
+    );
 
     // CLI 走增量路径，参数与参考一致（温度 0 即贪心，不涉及 RNG）。
     let output = run_cli(
@@ -876,7 +897,7 @@ fn cached_generation_matches_full_sequence_greedy() {
             "--top-p",
             "1",
             "--repeat-penalty",
-            "1",
+            "1.1",
         ],
     );
     assert!(output.status.success(), "退出码应为 0: {:?}", output.status);
@@ -900,6 +921,6 @@ fn cached_generation_matches_full_sequence_greedy() {
 
     assert_eq!(
         actual, expected,
-        "增量路径与整段路径的贪心序列不一致（夹具 tok5 贪心链前 {steps} 步）"
+        "增量路径与整段路径的贪心序列不一致（夹具 tok5 贪心链至 EOS）"
     );
 }

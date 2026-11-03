@@ -377,6 +377,10 @@ fn top_k(row: &[f32], k: usize) -> Vec<(usize, f32)> {
 ///
 /// cache 按模型配置在函数内构造一次：容量取 `max_position_embeddings`，
 /// KV 头数取 `num_kv_heads`（GQA 下不是 query 头数，见 `KvCache::new`）。
+/// 注意这是按标称最大上下文预分配：7B 级 MHA 模型（32 层 × 2048 × 32 KV 头 ×
+/// 128 维 × K/V × f32）约 2 GB，即使只生成几个 token 也会先付出这笔内存。
+/// 需要小量生成时，容量可安全地缩到 `prompt.len() + steps`（本阶段为对齐
+/// 任务书语义保持最大容量，不做收缩）。
 ///
 /// `eos_id` 给出时，遇到它立即停止且不计入生成结果——llama.cpp 同样不把 EOS
 /// 计入输出文本。`None` 表示模型没有 EOS，生成到上限为止。
@@ -396,7 +400,11 @@ fn generate(
     );
 
     let mut ids = prompt.to_vec();
-    let mut generated = Vec::with_capacity(steps);
+    // 预分配按实际可能生成的上限截断：位置守卫保证最多生成到上下文容量，
+    // 因此 steps 再离谱也不会超过 max_position_embeddings。直接按 steps
+    // 预分配会让 `--generate 1000000000000` 在申请 4 TB 时被分配器 abort，
+    // 连"上下文放不下"的可读错误都走不到。
+    let mut generated = Vec::with_capacity(steps.min(config.max_position_embeddings));
     // 第一批是整段 prompt（位置 0 起），之后每批只有一个新 token。
     let mut batch = prompt.to_vec();
     let mut position = 0usize;
