@@ -497,9 +497,8 @@ fn apply_causal_mask_offset(scores: &Tensor, query_offset: usize) -> Result<Tens
         ));
     }
     let mut masked = scores.clone();
-    // MUTATION TEST ONLY: uniform last-row window
     for query in 0..rows {
-        for key in (query_offset + rows - 1 + 1)..cols {
+        for key in (query_offset + query + 1)..cols {
             masked.set(&[query, key], f32::NEG_INFINITY)?;
         }
     }
