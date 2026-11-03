@@ -21,6 +21,7 @@
 //!
 //! **接真实 GGUF 模型时若输出乱码或数值对不上，首先检查此处。**
 
+use crate::kv_cache::KvCache;
 use crate::tensor::{Tensor, TensorOps};
 
 /// 词嵌入：按 token id 取权重行。
@@ -323,6 +324,110 @@ impl Attention {
         // 7. 输出投影。
         self.wo.forward(&merged)
     }
+
+    /// 增量前向：只计算新 token 的 Q/K/V，K/V 写入 KV Cache 后与历史拼接。
+    ///
+    /// 与 `forward` 的三处关键差异（除此之外算子序列完全一致）：
+    /// 1. RoPE 历史不重算：`k` 只旋转本次新段（rope 的 `start_pos` 参数即绝对
+    ///    位置），写入 cache 后原样读回；历史 K 在它自己的写入时刻已旋转过，
+    ///    再旋转一次等于叠加两份旋转，结果必然错。
+    /// 2. 因果掩码带偏移：分数矩阵是 `[new_len, total_len]` 矩形，第 i 个 query
+    ///    只能看见绝对位置 `<= start_pos + i` 的 key，掩码条件含 offset。
+    /// 3. 注意力键长是 `total_len = start_pos + new_len`，cache 读回的 K/V 头数
+    ///    是 `num_kv_heads`（GQA 分组在取头时处理，与整段路径同一公式）。
+    ///
+    /// 一致性：prefill 阶段（`start_pos == 0`）算子序列与 `forward` 逐项相同；
+    /// decode 阶段 softmax 只多出 `-inf → exp → 0` 的加零项，不改变数值。
+    /// 两条路径的逐值一致性由 `tests/transformer_forward.rs` 的对照测试锁定。
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        start_pos: usize,
+        kv_cache: &mut KvCache,
+        layer_idx: usize,
+    ) -> Result<Tensor, String> {
+        if hidden_states.ndim() != 2 {
+            return Err(format!(
+                "Attention input must be 2D [seq_len, hidden_size], got rank {}",
+                hidden_states.ndim()
+            ));
+        }
+        let new_len = hidden_states.dims()[0];
+        let head_dim = self.head_dim;
+
+        // 1. Q/K/V 投影，只算新段。
+        let q = self.wq.forward(hidden_states)?;
+        let k = self.wk.forward(hidden_states)?;
+        let v = self.wv.forward(hidden_states)?;
+
+        // 2. 拆头。
+        let q = q.reshape(vec![new_len, self.num_heads, head_dim])?;
+        let k = k.reshape(vec![new_len, self.num_kv_heads, head_dim])?;
+        let v = v.reshape(vec![new_len, self.num_kv_heads, head_dim])?;
+
+        // 3. RoPE：只旋转新段，位置从 start_pos 起算。
+        let q = q.rope(head_dim, start_pos, self.rope_theta)?;
+        let k = k.rope(head_dim, start_pos, self.rope_theta)?;
+
+        // 4. 写入 cache，再按"全部历史 + 新段"读回。绝对位置换算 i32 的
+        //    溢出与越界都由 KvCache 校验，这里先把转换错误显式报出。
+        let positions: Vec<i32> = (0..new_len)
+            .map(|offset| {
+                let position = start_pos
+                    .checked_add(offset)
+                    .ok_or_else(|| format!("position {start_pos} + {offset} overflows usize"))?;
+                i32::try_from(position).map_err(|_| {
+                    format!("position {position} exceeds the i32 range the cache uses")
+                })
+            })
+            .collect::<Result<Vec<i32>, String>>()?;
+        kv_cache.update(layer_idx, &k, &v, &positions)?;
+
+        let total_len = start_pos + new_len;
+        let all_positions: Vec<i32> = (0..total_len)
+            .map(|position| {
+                i32::try_from(position).map_err(|_| {
+                    format!("position {position} exceeds the i32 range the cache uses")
+                })
+            })
+            .collect::<Result<Vec<i32>, String>>()?;
+        let (k, v) = kv_cache.get(layer_idx, &all_positions)?;
+
+        // 5. 转到 head 主序，与整段路径同构。
+        let q = q.transpose(0, 1)?;
+        let k = k.transpose(0, 1)?;
+        let v = v.transpose(0, 1)?;
+
+        // 6. 逐头计算：查询是 new_len 行，键是 total_len 列。
+        let group = self.num_heads / self.num_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut heads = Vec::with_capacity(self.num_heads);
+        for head in 0..self.num_heads {
+            let q_h = head_matrix(&q, head, new_len, head_dim)?;
+            let kv_head = head / group;
+            let k_h = head_matrix(&k, kv_head, total_len, head_dim)?;
+            let v_h = head_matrix(&v, kv_head, total_len, head_dim)?;
+
+            let scores = q_h.matmul(&k_h.transpose(0, 1)?)?;
+            let scores = scores.scale(scale)?;
+            let scores = apply_causal_mask_offset(&scores, start_pos)?;
+            let probabilities = scores.softmax(1)?;
+            heads.push(probabilities.matmul(&v_h)?);
+        }
+
+        // 7. 合并头：布局与整段路径一致，只是行数是 new_len。
+        let mut merged_data = Vec::with_capacity(new_len * self.num_heads * head_dim);
+        for position in 0..new_len {
+            for head in &heads {
+                let start = position * head_dim;
+                merged_data.extend_from_slice(&head.data()[start..start + head_dim]);
+            }
+        }
+        let merged = Tensor::new(merged_data, vec![new_len, self.num_heads * head_dim]);
+
+        // 8. 输出投影。
+        self.wo.forward(&merged)
+    }
 }
 
 /// 从 `[heads, seq_len, head_dim]` 中取出第 `head` 个头的二维矩阵。
@@ -340,18 +445,40 @@ fn head_matrix(
 /// 施加因果掩码：分数矩阵中 `j > i` 的位置置为 `-inf`。
 ///
 /// 只处理整段序列前向（无 KV Cache），因此查询与键的绝对位置相差同样的
-/// `start_pos`，掩码条件与 `start_pos` 无关。
+/// `start_pos`，掩码条件与 `start_pos` 无关。带 offset 的增量场景走
+/// [`apply_causal_mask_offset`]；这里保持原签名，让整段路径的调用点不动。
 fn apply_causal_mask(scores: &Tensor) -> Result<Tensor, String> {
-    if scores.ndim() != 2 || scores.dims()[0] != scores.dims()[1] {
+    apply_causal_mask_offset(scores, 0)
+}
+
+/// 因果掩码的带偏移形式：查询行 `i` 对应绝对位置 `query_offset + i`，
+/// 只能看见绝对位置 `<= query_offset + i` 的键列。
+///
+/// 增量前向的分数矩阵是 `[new_len, total_len]` 矩形：query 只覆盖新段，
+/// key 覆盖整段历史，两侧位置差了一个 `start_pos`。此时**不能**沿用整段
+/// 路径的 `j > i`——那会把历史列整体错切，把 query 该看的 key 掩掉、
+/// 不该看的未来 key 漏掉。
+///
+/// 要求 `cols >= rows + query_offset`：键列比因果窗口还短，说明调用方给的
+/// 位置关系不自洽，报错而不是静默减少可见列。
+fn apply_causal_mask_offset(scores: &Tensor, query_offset: usize) -> Result<Tensor, String> {
+    if scores.ndim() != 2 {
         return Err(format!(
-            "Causal mask expects a square 2D score matrix, got {:?}",
+            "Causal mask expects a 2D score matrix, got rank {}",
+            scores.ndim()
+        ));
+    }
+    let (rows, cols) = (scores.dims()[0], scores.dims()[1]);
+    if cols < rows + query_offset {
+        return Err(format!(
+            "Causal mask got {:?}: {cols} key column(s) cannot cover \
+             {rows} query row(s) starting at offset {query_offset}",
             scores.dims()
         ));
     }
-    let seq_len = scores.dims()[0];
     let mut masked = scores.clone();
-    for query in 0..seq_len {
-        for key in (query + 1)..seq_len {
+    for query in 0..rows {
+        for key in (query_offset + query + 1)..cols {
             masked.set(&[query, key], f32::NEG_INFINITY)?;
         }
     }
@@ -426,6 +553,31 @@ impl TransformerBlock {
     pub fn forward(&self, hidden_states: &Tensor, start_pos: usize) -> Result<Tensor, String> {
         let normed = self.input_layernorm.forward(hidden_states)?;
         let attended = self.self_attn.forward(&normed, start_pos)?;
+        let residual = hidden_states.add(&attended)?;
+
+        let normed = self.post_attention_layernorm.forward(&residual)?;
+        let fed_forward = self.mlp.forward(&normed)?;
+        residual.add(&fed_forward)
+    }
+
+    /// 增量前向：`hidden_states` 只含新 token 的隐状态，形状
+    /// `[new_len, hidden_size]`。
+    ///
+    /// 残差连接与前馈部分与 `forward` 逐行相同（Mlp 无状态，直接复用），
+    /// 差异全部集中在注意力的 cache 读写上，见
+    /// [`Attention::forward_with_cache`]。`layer_idx` 是本层在
+    /// [`KvCache`] 中的槽位下标，由调用方按层序传入。
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        start_pos: usize,
+        kv_cache: &mut KvCache,
+        layer_idx: usize,
+    ) -> Result<Tensor, String> {
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attended = self
+            .self_attn
+            .forward_with_cache(&normed, start_pos, kv_cache, layer_idx)?;
         let residual = hidden_states.add(&attended)?;
 
         let normed = self.post_attention_layernorm.forward(&residual)?;

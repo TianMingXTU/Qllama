@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use qllama::gguf::{GgufFile, GgufValue, ModelMetadata};
+use qllama::sampler::{Sampler, SamplerConfig};
+use qllama::tokenizer::{EncodeOptions, Tokenizer};
+use qllama::transformer::Transformer;
 
 const N_EMBD: usize = 32;
 const N_FF: usize = 64;
@@ -810,5 +813,93 @@ fn generation_stops_early_when_the_model_emits_eos() {
     assert!(
         !ids.contains(&1),
         "EOS(id 1) 不应出现在生成结果里: {generated}"
+    );
+}
+
+#[test]
+fn cached_generation_matches_full_sequence_greedy() {
+    // 阶段 5 红线：--generate 现在走 KV Cache 增量路径，贪心（温度 0）下
+    // 生成的 token 序列必须与"每步重算整段序列"的旧路径逐个相同。
+    //
+    // 对照基准在测试内独立重放旧循环（整段 forward + 同参数采样），
+    // CLI 二进制则跑新路径。两条路径的 logits 只差浮点末位，若增量实现
+    // 在 RoPE 重算、因果掩码偏移或 GQA 取头上任一处出错，贪心链会很快
+    // 分叉，序列不再相等。采样参数全部显式传给 CLI，避免默认值漂移。
+    let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tiny-llama.gguf");
+    let steps = 12;
+
+    // 参考序列：整段前向 + 同参数贪心采样（旧 generate 的循环结构）。
+    let gguf = GgufFile::from_path(&model_path).expect("读取夹具失败");
+    let model = Transformer::from_gguf(&gguf).expect("加载模型失败");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("加载分词器失败");
+    let prompt = tokenizer
+        .encode_with_options(
+            "tok5",
+            &EncodeOptions {
+                add_bos: true,
+                add_eos: false,
+            },
+        )
+        .expect("编码失败");
+    let sampler_config = SamplerConfig {
+        temperature: 0.0,
+        top_k: 0,
+        top_p: 1.0,
+        repeat_penalty: 1.0,
+    };
+    let mut sampler = Sampler::new(sampler_config);
+    let mut ids = prompt.clone();
+    let mut expected = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let logits = model.forward(&ids, 0).expect("整段前向失败");
+        let columns = logits.dims()[1];
+        let last = &logits.data()[(ids.len() - 1) * columns..ids.len() * columns];
+        expected.push(sampler.sample_slice(last, &ids).expect("采样失败"));
+        ids.push(*expected.last().expect("刚推进过一个 token"));
+    }
+
+    // CLI 走增量路径，参数与参考一致（温度 0 即贪心，不涉及 RNG）。
+    let output = run_cli(
+        &model_path,
+        &[
+            "--prompt",
+            "tok5",
+            "--generate",
+            &steps.to_string(),
+            "--temperature",
+            "0",
+            "--top-k",
+            "0",
+            "--top-p",
+            "1",
+            "--repeat-penalty",
+            "1",
+        ],
+    );
+    assert!(output.status.success(), "退出码应为 0: {:?}", output.status);
+    let generated = stdout_of(&output)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("generated "))
+        .expect("输出缺少 generated 行")
+        .to_string();
+    let list = generated
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(inside, _)| inside.trim())
+        .expect("generated 行应给出 id 列表");
+    let actual: Vec<i32> = if list.is_empty() {
+        Vec::new()
+    } else {
+        list.split(',')
+            .map(|value| value.trim().parse::<i32>().expect("id 应可解析"))
+            .collect()
+    };
+
+    assert_eq!(
+        actual, expected,
+        "增量路径与整段路径的贪心序列不一致（夹具 tok5 贪心链前 {steps} 步）"
     );
 }

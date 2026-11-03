@@ -4,6 +4,7 @@
 //! 不调用待测代码的任何路径。权重在测试内自行生成，与
 //! `Transformer::tiny_for_testing` 的种子无关，避免两侧共享隐藏假设。
 
+use qllama::kv_cache::KvCache;
 use qllama::transformer::layers::{Attention, Embedding, Linear, Mlp, RmsNorm, TransformerBlock};
 use qllama::transformer::{Transformer, TransformerConfig};
 
@@ -646,4 +647,241 @@ fn forward_output_shape_scales_with_sequence_length() {
             "seq_len={seq_len} 时形状不符"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// KV Cache 增量路径与整段路径的数值一致性（阶段 5 核心验收）
+//
+// 整段路径 `forward` 是对照基准：它的数值已由上面的 f64 参考实现锁定。
+// 这里的每个用例都从不同切分角度重放同一序列，要求增量路径的末行（或每行）
+// 与整段路径逐值一致。三条差异点各有用例针对性覆盖：
+//   - RoPE 历史不重算：任意"先在 cache 里走一段、再显式 offset 喂新 token"
+//     的切分，若读回时二次旋转立刻偏掉；
+//   - 因果掩码带 offset：单 token decode 行只许看 <= start_pos 的列；
+//   - GQA 头索引：kv_heads < heads 的配置单独覆盖。
+// ---------------------------------------------------------------------------
+
+/// 路径间容差：两条路径的算子序列一致，理论上只差 softmax 里
+/// `-inf -> exp -> 0` 的加零项与求和次序，1e-5 留有充分余量。
+const PATH_TOLERANCE: f32 = 1e-5;
+
+fn cache_for(config: &TinyConfig) -> KvCache {
+    KvCache::new(
+        config.layers,
+        config.max_pos,
+        config.kv_heads,
+        config.head_dim(),
+    )
+}
+
+/// 取 logits 最后一行的拷贝。
+fn last_row(logits: &qllama::tensor::Tensor) -> Vec<f32> {
+    let [seq_len, vocab] = logits.dims() else {
+        panic!("logits 应为 2D，得到 {:?}", logits.dims());
+    };
+    logits.data()[(seq_len - 1) * vocab..*seq_len * vocab].to_vec()
+}
+
+/// 按给定切分增量跑完整个序列，返回最后一次调用的末行 logits。
+///
+/// `splits` 是各批次的长度，必须恰好覆盖全部 token：如 `[1, 1, 3]` 表示
+/// 先喂 1 个、再喂 1 个、最后一批 3 个。每批都是独立的
+/// `forward_with_cache` 调用，位置由 cache 的 `current_len` 自然推进，
+/// 批与批之间的绝对位置衔接正是被测行为的一部分。
+fn incremental_last_row_by_splits(
+    model: &Transformer,
+    config: &TinyConfig,
+    tokens: &[i32],
+    splits: &[usize],
+) -> Vec<f32> {
+    assert_eq!(
+        splits.iter().sum::<usize>(),
+        tokens.len(),
+        "切分必须覆盖全部 token"
+    );
+    assert!(!splits.is_empty(), "至少需要一个批次");
+
+    let mut cache = cache_for(config);
+    let mut position = 0;
+    let mut logits = None;
+    for &batch_len in splits {
+        let batch = &tokens[position..position + batch_len];
+        logits = Some(
+            model
+                .forward_with_cache(batch, position, &mut cache)
+                .unwrap_or_else(|error| {
+                    panic!("位置 {position} 批量 {batch_len} 增量前向失败: {error}")
+                }),
+        );
+        position += batch_len;
+    }
+    last_row(logits.as_ref().expect("上面至少迭代了一次"))
+}
+
+/// 逐元素断言两个 logits 张量相等（容差内）。
+fn assert_logits_close(
+    actual: &qllama::tensor::Tensor,
+    expected: &qllama::tensor::Tensor,
+    context: &str,
+) {
+    assert_eq!(actual.dims(), expected.dims(), "{context}: 形状不符");
+    for (index, (&got, &want)) in actual.data().iter().zip(expected.data()).enumerate() {
+        assert!(
+            (got - want).abs() <= PATH_TOLERANCE,
+            "{context}: 第 {index} 个元素应为 {want}，得到 {got}"
+        );
+    }
+}
+
+/// 逐元素断言两行 logits 相等（容差内）。
+fn assert_rows_close(actual: &[f32], expected: &[f32], context: &str) {
+    assert_eq!(actual.len(), expected.len(), "{context}: 元素个数不符");
+    for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            (got - want).abs() <= PATH_TOLERANCE,
+            "{context}: 第 {index} 个元素应为 {want}，得到 {got}"
+        );
+    }
+}
+
+#[test]
+fn prefill_via_cache_matches_full_forward_every_row() {
+    // prefill（start_pos=0 的整批）与整段路径算子序列完全相同，
+    // 应当逐值相等；这条锁的是 cache 读写的接线，不是数值近似。
+    let config = tiny_config();
+    let model = Transformer::tiny_for_testing(config.to_config()).expect("构造失败");
+    let tokens = tokens_for(&config);
+
+    let full = model.forward(&tokens, 0).expect("整段前向失败");
+    let mut cache = cache_for(&config);
+    let cached = model
+        .forward_with_cache(&tokens, 0, &mut cache)
+        .expect("prefill 失败");
+
+    assert_eq!(cached.dims(), full.dims());
+    assert_logits_close(&cached, &full, "prefill vs 整段");
+    assert_eq!(cache.seq_len(), tokens.len());
+}
+
+#[test]
+fn incremental_decode_matches_full_forward_at_every_length() {
+    // 首 token prefill、其余逐 token decode（最贴近真实生成循环的切分），
+    // 序列长度从 1 到 4 全覆盖。
+    let config = tiny_config();
+    let model = Transformer::tiny_for_testing(config.to_config()).expect("构造失败");
+
+    for seq_len in 1..5 {
+        let tokens: Vec<i32> = (0..seq_len as i32)
+            .map(|i| i % config.vocab as i32)
+            .collect();
+        let expected = last_row(&model.forward(&tokens, 0).expect("整段前向失败"));
+        let splits = vec![1; seq_len];
+        let actual = incremental_last_row_by_splits(&model, &config, &tokens, &splits);
+        assert_rows_close(&actual, &expected, &format!("长度 {seq_len} 逐 token 解码"));
+    }
+}
+
+#[test]
+fn incremental_splits_all_match_full_forward() {
+    // 同一序列的不同批量切分必须收敛到同一末行：位置簿记若与批次形状
+    // 耦合（比如把 batch 内偏移当成绝对位置），换一种切分就会偏。
+    let config = tiny_config();
+    let model = Transformer::tiny_for_testing(config.to_config()).expect("构造失败");
+    let tokens: Vec<i32> = (0..5).map(|i| i % config.vocab as i32).collect();
+
+    let expected = last_row(&model.forward(&tokens, 0).expect("整段前向失败"));
+    for splits in [
+        vec![1, 1, 1, 1, 1],
+        vec![1, 2, 2],
+        vec![2, 3],
+        vec![3, 1, 1],
+        vec![5],
+        vec![4, 1],
+    ] {
+        let actual = incremental_last_row_by_splits(&model, &config, &tokens, &splits);
+        assert_rows_close(&actual, &expected, &format!("切分 {splits:?}"));
+    }
+}
+
+#[test]
+fn incremental_decode_matches_full_forward_under_gqa() {
+    // GQA（heads=4, kv_heads=2, 分组大小 2）：cache 里每个 KV 头被两个
+    // query 头共享。若 kv_head 错取 head 而非 head/group，两组 query 头会
+    // 读到同一份 K/V，末行立刻偏掉。
+    let mut config = tiny_config();
+    config.hidden = 8;
+    config.heads = 4;
+    config.kv_heads = 2;
+    let model = Transformer::tiny_for_testing(config.to_config()).expect("构造失败");
+    let tokens: Vec<i32> = (0..5).map(|i| i % config.vocab as i32).collect();
+
+    let expected = last_row(&model.forward(&tokens, 0).expect("整段前向失败"));
+    let actual = incremental_last_row_by_splits(&model, &config, &tokens, &[1, 1, 1, 1, 1]);
+    assert_rows_close(&actual, &expected, "GQA 4 头 / 2 KV 头逐 token 解码");
+}
+
+#[test]
+fn incremental_decode_matches_the_independent_reference() {
+    // 增量路径不只对齐整段路径，还要对齐测试自有的 f64 参考实现：
+    // 否则两条路径一起错也会显得"一致"。切分取 [1, 2]：一次单 token
+    // decode 接一次两 token 批量，覆盖两种批次形状。
+    let config = tiny_config();
+    let weights = reference_weights(&config);
+    let model = model_from_reference(&config, &weights);
+    let tokens = tokens_for(&config);
+
+    let expected = reference_transformer(&tokens, &weights, &config, 0);
+    let expected_last = expected.last().expect("参考实现应有输出行");
+    let actual = incremental_last_row_by_splits(&model, &config, &tokens, &[1, 2]);
+
+    assert_eq!(actual.len(), expected_last.len());
+    for (index, (&got, &want)) in actual.iter().zip(expected_last).enumerate() {
+        assert!(
+            (got - want as f32).abs() <= 1e-3,
+            "第 {index} 个元素参考值为 {want}，增量路径得到 {got}"
+        );
+    }
+}
+
+#[test]
+fn repeated_prefill_is_rejected_by_the_cache() {
+    // 同一份 cache 连续 prefill 两遍，第二次必须被 KvCache 的连续性
+    // 规则拒绝，而不是把序列写重或静默跳过。
+    let config = tiny_config();
+    let model = Transformer::tiny_for_testing(config.to_config()).expect("构造失败");
+    let tokens = tokens_for(&config);
+    let mut cache = cache_for(&config);
+
+    model
+        .forward_with_cache(&tokens, 0, &mut cache)
+        .expect("首次 prefill 应成功");
+    assert_eq!(cache.seq_len(), tokens.len());
+
+    let error = model
+        .forward_with_cache(&tokens, 0, &mut cache)
+        .expect_err("重复 prefill 应被拒绝");
+    assert!(
+        error.contains("must continue"),
+        "错误应指出位置必须接续 current_len，实际: {error}"
+    );
+    // 被拒绝的写入不得推进长度
+    assert_eq!(cache.seq_len(), tokens.len());
+}
+
+#[test]
+fn incremental_forward_rejects_positions_beyond_max_position_embeddings() {
+    // 与整段路径同一道边界守卫：末位置越界必须报错，且 cache 不得被
+    // 部分写入（守卫在任何投影之前）。
+    let config = tiny_config();
+    let model = Transformer::tiny_for_testing(config.to_config()).expect("构造失败");
+    let mut cache = cache_for(&config);
+
+    let error = model
+        .forward_with_cache(&[0], config.max_pos, &mut cache)
+        .expect_err("末位置越界应被拒绝");
+    assert!(
+        error.contains("exceeds max_position_embeddings"),
+        "实际: {error}"
+    );
+    assert_eq!(cache.seq_len(), 0, "越界调用不得写进 cache");
 }

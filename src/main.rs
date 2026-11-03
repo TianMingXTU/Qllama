@@ -367,11 +367,16 @@ fn top_k(row: &[f32], k: usize) -> Vec<(usize, f32)> {
         .collect()
 }
 
-/// 采样生成：每步用最后位置的 logits 采样一个 token，追加到序列后继续。
+/// 采样生成：prefill 整段 prompt，之后每步只前向一个新 token。
 ///
-/// 无 KV Cache，因此每步都重新前向整段序列，代价是 O(n²)。这一步只作端到端
-/// 联调；接上 KV Cache 后应改为增量前向，届时 `forward(ids, 0)` 的调用形态
-/// 与这里的循环结构都要一起调整。
+/// 两阶段结构对应 KV Cache 的两种用法：
+/// 1. prefill：`forward_with_cache(prompt, 0, cache)` 一次算完 prompt 全部
+///    位置的 K/V 并写入 cache，取末行 logits 采出第一个 token；
+/// 2. decode：之后每步只喂单个新 token，`start_pos` 随已生成长度前进，
+///    K/V 与 cache 中的历史拼接——每步代价从 O(n²) 降到 O(n)。
+///
+/// cache 按模型配置在函数内构造一次：容量取 `max_position_embeddings`，
+/// KV 头数取 `num_kv_heads`（GQA 下不是 query 头数，见 `KvCache::new`）。
 ///
 /// `eos_id` 给出时，遇到它立即停止且不计入生成结果——llama.cpp 同样不把 EOS
 /// 计入输出文本。`None` 表示模型没有 EOS，生成到上限为止。
@@ -382,10 +387,23 @@ fn generate(
     steps: usize,
     eos_id: Option<i32>,
 ) -> anyhow::Result<Vec<i32>> {
+    let config = model.config();
+    let mut kv_cache = qllama::kv_cache::KvCache::new(
+        config.num_layers,
+        config.max_position_embeddings,
+        config.num_kv_heads,
+        config.head_dim(),
+    );
+
     let mut ids = prompt.to_vec();
     let mut generated = Vec::with_capacity(steps);
+    // 第一批是整段 prompt（位置 0 起），之后每批只有一个新 token。
+    let mut batch = prompt.to_vec();
+    let mut position = 0usize;
     for _ in 0..steps {
-        let logits = model.forward(&ids, 0).map_err(anyhow::Error::msg)?;
+        let logits = model
+            .forward_with_cache(&batch, position, &mut kv_cache)
+            .map_err(anyhow::Error::msg)?;
         let (last_row, _) = last_position_row(&logits)?;
         // context 传当前完整序列：重复惩罚要看到 prompt 里的每个 token。
         let next = sampler
@@ -396,6 +414,8 @@ fn generate(
         }
         generated.push(next);
         ids.push(next);
+        position += batch.len();
+        batch = vec![next];
     }
     Ok(generated)
 }
