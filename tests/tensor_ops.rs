@@ -893,3 +893,107 @@ fn readme_broadcast_and_softmax_example() {
         1e-5,
     );
 }
+
+/// llama.cpp `GGML_ROPE_TYPE_NORMAL` 配对方式的独立参考实现。
+///
+/// 翻译的是上游两条链：`ggml/src/ggml.c:4327` 的 `ggml_rope_impl()` 决定调用哪个
+/// CPU 算子，`ggml/src/ggml-cpu/ops.cpp:6295` 的 `ggml_compute_forward_rope_flt()`
+/// 在 `:6419-6420` 用 `rotate_pairs<T>(n_dims, 1, cache, src + n_offs,
+/// dst_data + n_offs, 1)` 处理 NORMAL 分支；`rotate_pairs()` 的签名与函数体在
+/// `:6276-6292`（参数是 `n, n_offset, cache, src_data, dst_data, scale=2`，
+/// NORMAL 显式传 `n_offset=1, scale=1`）。于是第 i 对取 **相邻** 元素
+/// `(x[2i], x[2i+1])`，角频率 `theta^(-2i/n_dims)`。
+///
+/// 本函数只按上述定义用 f64 计算，不调用被测代码，因此可以充当 `rope` 的第二意见。
+fn llama_cpp_normal_reference(x: &[f32], head_dim: usize, pos: usize, theta: f64) -> Vec<f32> {
+    let mut output = Vec::with_capacity(x.len());
+    for (sequence, chunk) in x.chunks_exact(head_dim).enumerate() {
+        let position = (pos + sequence) as f64;
+        for pair in 0..head_dim / 2 {
+            let frequency = theta.powf(-2.0 * pair as f64 / head_dim as f64);
+            let (sin, cos) = (position * frequency).sin_cos();
+            let first = f64::from(chunk[2 * pair]);
+            let second = f64::from(chunk[2 * pair + 1]);
+            output.push((first * cos - second * sin) as f32);
+            output.push((first * sin + second * cos) as f32);
+        }
+    }
+    output
+}
+
+/// HF `rotate_half`（llama.cpp 的 NEOX 分支）配对方式：`(x[i], x[i + head_dim/2])`。
+/// 用于判别性断言——它必须与我们的实现**不相等**。
+fn hf_rotate_half_reference(x: &[f32], head_dim: usize, pos: usize, theta: f64) -> Vec<f32> {
+    let mut output = vec![0.0f32; x.len()];
+    let half = head_dim / 2;
+    for (sequence, chunk) in x.chunks_exact(head_dim).enumerate() {
+        let position = (pos + sequence) as f64;
+        for pair in 0..half {
+            let frequency = theta.powf(-2.0 * pair as f64 / head_dim as f64);
+            let (sin, cos) = (position * frequency).sin_cos();
+            let first = f64::from(chunk[pair]);
+            let second = f64::from(chunk[pair + half]);
+            output[sequence * head_dim + pair] = (first * cos - second * sin) as f32;
+            output[sequence * head_dim + pair + half] = (first * sin + second * cos) as f32;
+        }
+    }
+    output
+}
+
+/// 判别测试①：`rope` 必须逐元素等于 llama.cpp NORM 分支的独立翻译。
+///
+/// head_dim=8、pos=1..2、theta=10000 下各对使用明显不同的频率，
+/// 使相邻对与半距对两种配对方式给出不同结果（见判别测试②）。
+#[test]
+fn rope_matches_llamacpp_normal_pairing_reference() {
+    // 形状 [2, 8]：2 个序列位置 × 1 个头 × head_dim 8，参考实现按位置递增取角度。
+    let input = tensor(
+        &[
+            1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16.,
+        ],
+        &[2, 8],
+    );
+    let actual = input.rope(8, 1, 10_000.).unwrap();
+    let expected = llama_cpp_normal_reference(input.data(), 8, 1, 10_000.);
+    assert_tensor(&actual, &[2, 8], &expected);
+}
+
+/// 判别测试②：同一输入下，我们的 `rope` 与 HF `rotate_half`（NEOX）必须**不相等**。
+///
+/// 这是阶段 7 用真实训练模型（stories15M，llama 架构）确认过的结论：
+/// llama 架构取 `LLAMA_ROPE_TYPE_NORM`，配对方式错误会让末行 logits argmax 翻转、
+/// 逐元素偏差达 9.12（tiny-f32 随机权重夹具对该错误几乎不敏感，偏差只有 5.8e-04，
+/// 所以本用例用放大差异的手工输入固定性质，不依赖任何模型；模型指纹与复现命令
+/// 见 `tests/golden/` 的 TSV 头部）。
+#[test]
+fn rope_rejects_hf_rotate_half_pairing() {
+    let input = tensor(
+        &[
+            -2.0, 0.33333334, -1.6666667, 0.6666667, -1.3333334, 1.0, -1.0, 1.3333334,
+        ],
+        &[1, 8],
+    );
+    let actual = input.rope(8, 1, 10_000.).unwrap();
+    let normal = llama_cpp_normal_reference(input.data(), 8, 1, 10_000.);
+    let neox = hf_rotate_half_reference(input.data(), 8, 1, 10_000.);
+
+    // 两种配对方式本身必须可区分，否则本用例没有判别力。
+    let separation = normal
+        .iter()
+        .zip(&neox)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(separation > 0.5, "参考实现之间差异过小: {separation}");
+
+    assert_tensor(&actual, &[1, 8], &normal);
+    let distance_to_neox = actual
+        .data()
+        .iter()
+        .zip(&neox)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        distance_to_neox > 0.5,
+        "rope 结果不应接近 HF rotate_half: 最大偏差 {distance_to_neox}"
+    );
+}

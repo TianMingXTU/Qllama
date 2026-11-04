@@ -10,16 +10,41 @@
 //! 只需一次 `matmul`。选择在构造时转置而非每次前向转置，是因为后者会对每个
 //! token 都复制一遍权重矩阵；构造期的一次性代价可以忽略。
 //!
-//! ## RoPE 约定（关键，接真实模型前必须复核）
+//! ## RoPE 配对方式（关键，已用 llama.cpp 与真实模型确认）
 //!
 //! [`Attention`] 通过 [`crate::tensor::TensorOps::rope`] 施加旋转位置编码，
 //! 该实现旋转**相邻元素对** `(x[0],x[1]), (x[2],x[3]), ...`，即 llama.cpp 的
-//! `GGML_ROPE_TYPE_NORM`，已由上游源码确认是 `LLM_ARCH_LLAMA` 的行为。
+//! `GGML_ROPE_TYPE_NORMAL`。以下游源码为据（llama.cpp tag `b12110`，逐条核对过）：
 //!
-//! 但 HuggingFace 的 Llama 参考实现普遍使用 `rotate_half` 的**对半拆分**风格
-//! `(x[0],x[d/2]), (x[1],x[d/2+1]), ...`，两者在 `d > 2` 时结果不同。
+//! - `src/llama-model.cpp:3601` `llama_model_rope_type()` 里，llama 架构的 case
+//!   列表起于 `:3631`（`case LLM_ARCH_LLAMA:` 及同组的 LLADA/LLAMA4/DECI...），
+//!   `LLM_ARCH_LLAMA_EMBED` 在 `:3671`，整组统一的
+//!   `return LLAMA_ROPE_TYPE_NORM;` 在 `:3678` —— llama 架构取 NORMAL，不是 NEOX。
+//! - `ggml/src/ggml-cpu/ops.cpp:6419-6420` `case GGML_ROPE_TYPE_NORMAL:
+//!   rotate_pairs<T>(n_dims, /*n_offset=*/1, cache, src + n_offs, dst_data + n_offs,
+//!   /*scale=*/1);`；对照 `:6425` 的 NEOX 分支传 `n_offset = n_dims/2`。
+//! - `ggml/src/ggml-cpu/ops.cpp:6276-6292` `rotate_pairs()`：`scale = 1` 使
+//!   `ic = i0/scale = i0`，于是旋转的两个元素是 `src[i0]` 与 `src[i0 + 1]`
+//!   ——相邻；`scale = 2` 时 `ic = i0/2`，两个元素相距 `n_offset = n_dims/2`。
+//! - `ggml/include/ggml.h:1910-1913` 的示例表把这一点说得很直白：
+//!   `head size 8` 下 `NORMAL n_dims=8 → [cscscscs]`，`NEOX n_dims=8 → [ccccssss]`。
+//! - `ggml/include/ggml.h:250-251` 定义 `GGML_ROPE_TYPE_NORMAL 0`、
+//!   `GGML_ROPE_TYPE_NEOX 2`。
 //!
-//! **接真实 GGUF 模型时若输出乱码或数值对不上，首先检查此处。**
+//! HuggingFace 的 Llama 参考实现用 `rotate_half` 的**对半拆分**
+//! `(x[0],x[d/2]), (x[1],x[d/2+1]), ...`，等价于上游的 NEOX 分支，与 llama.cpp
+//! 的 llama 模型不同。阶段 7 在真实训练模型（stories15M）上实测过这个区别：
+//! 把本仓库实现改成 half-split 配对后，末位置 logits 的 argmax 从 13 翻到 450、
+//! 逐元素最大偏差 9.12（判别性用例见 `tests/tensor_ops.rs` 的
+//! `rope_rejects_hf_rotate_half_pairing`；模型指纹与复现命令记录在
+//! `tests/golden/` 的 TSV 头部）。
+//!
+//! 角度本身仍可能有微小差别：上游 `ggml_rope_cache_init`（`ops.cpp:6190-6201`）用
+//! f32 累乘 `theta *= theta_scale`（`ops.cpp:6356` 的
+//! `theta_scale = powf(freq_base, -2.0f/n_dims)`），本实现在 f64 下直接取幂
+//! `theta^(-2i/n_dims)`；差值在 f32 舍入量级，实测不影响 top-16 排序。
+//! 分母 `n_dims` 即被旋转的维度数：本项目的配置层拒绝 `rope.dimension_count !=
+//! head_dim` 的 partial RoPE（见 `transformer::config`），因此两者恒等。
 
 use crate::kv_cache::KvCache;
 use crate::tensor::{Tensor, TensorOps};

@@ -32,6 +32,10 @@ pub trait TensorOps {
     /// 序列位置为 start_pos 加首维索引，第 i 对频率为 theta^(-2i/head_dim)。
     /// 要求至少二维、head_dim 为正偶数且等于末维、theta 为正有限数；
     /// 参数无效或末位置溢出时返回错误。角度和旋转使用 f64，非有限数据按浮点规则传播。
+    ///
+    /// "相邻元素对"是与 llama.cpp `GGML_ROPE_TYPE_NORMAL` 对齐的选择，不是可自由
+    /// 替换的实现细节：改成对半拆分（HuggingFace `rotate_half`）会偏离 llama 架构
+    /// 权重，依据与实测影响见 [`crate::transformer::layers`] 模块文档。
     fn rope(&self, head_dim: usize, start_pos: usize, theta: f32) -> Result<Tensor, String>;
 
     /// 逐元素计算稳定的 SiLU，保持形状；NaN 传播，正无穷映射到正无穷，负无穷映射到负零。
