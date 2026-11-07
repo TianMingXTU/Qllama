@@ -4,6 +4,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
 
 use super::loader::{checked_product, f16_to_f32};
 use super::GgmlType;
@@ -120,7 +122,12 @@ impl MappedWeight {
     /// 计算 `input * weight^T`；输入 `[rows, in]`，输出 `[rows, out]`。
     ///
     /// 权重始终从映射读取；量化临时缓冲仅为栈上的一个 32 元素块。每个输出的
-    /// 累加顺序固定为输入特征从左至右，与原有标量 matmul 的顺序一致。
+    /// 累加顺序固定为输入特征从左至右，与原有标量 matmul 的顺序一致，因此并行
+    /// 划分不改变任何数值结果。
+    ///
+    /// 并行策略：多行（prefill）按行划分，行间天然独立；单行（decode）没有行级
+    /// 并行度，改为把输出列分块交给 Rayon，让 1B 级模型的每步 decode 也能吃满
+    /// 线程。列分块大小取 64，摊薄调度开销又不至于让尾块失衡。
     pub fn matmul(&self, input: &Tensor) -> Result<Tensor, String> {
         if self.dims.len() != 2 || input.ndim() != 2 || input.dims()[1] != self.dims[1] {
             return Err(format!(
@@ -134,11 +141,26 @@ impl MappedWeight {
             .checked_mul(columns)
             .ok_or_else(|| "Matmul output size overflows usize".to_string())?;
         let mut output = vec![0.0; length];
-        for (row, result) in output.chunks_mut(columns).enumerate() {
-            let x = &input.data()[row * width..(row + 1) * width];
-            for (column, value) in result.iter_mut().enumerate() {
-                *value = self.dot(x, column);
+        if rows == 1 {
+            const BLOCK: usize = 64;
+            let row_input = &input.data()[..width];
+            for start in (0..columns).step_by(BLOCK) {
+                let end = (start + BLOCK).min(columns);
+                output[start..end]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(offset, value)| *value = self.dot(row_input, start + offset));
             }
+        } else {
+            output
+                .par_chunks_mut(columns)
+                .enumerate()
+                .for_each(|(row, result)| {
+                    let x = &input.data()[row * width..(row + 1) * width];
+                    for (column, value) in result.iter_mut().enumerate() {
+                        *value = self.dot(x, column);
+                    }
+                });
         }
         Ok(Tensor::new(output, vec![rows, columns]))
     }
