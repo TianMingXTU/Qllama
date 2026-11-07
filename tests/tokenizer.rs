@@ -1092,6 +1092,109 @@ fn spm_decode_removes_only_synthetic_space_per_fragment() {
     assert_eq!(tokenizer.decode(&ids).unwrap(), text);
 }
 
+/// 逐 token 喂入，结果必须与一次性 `decode` 完全一致——CLI 的流式输出
+/// 只是把同一套片段规则搬到增量路径上，不是第二份解码语义。
+fn stream_all(tokenizer: &Tokenizer, ids: &[i32]) -> String {
+    let mut stream = tokenizer.stream();
+    let mut text = String::new();
+    for &id in ids {
+        text.push_str(&stream.push(id).unwrap());
+    }
+    text.push_str(&stream.finish());
+    text
+}
+
+#[test]
+fn stream_reassembles_multibyte_text_token_by_token() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    let text = "  中文 a🦊b\n\t  ";
+    let ids = tokenizer.encode_with_options(text, &no_special()).unwrap();
+    let streamed = stream_all(&tokenizer, &ids);
+    assert_eq!(streamed, text, "逐 token 流式解码与 decode 不一致");
+    assert_eq!(streamed, tokenizer.decode(&ids).unwrap());
+}
+
+#[test]
+fn stream_withholds_incomplete_characters() {
+    // 一个字符的字节被拆成多个 byte token 时，前面几步不能吐半个字符，
+    // 否则终端会看到乱码；攒够一个完整 UTF-8 序列才允许输出。
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    let mut stream = tokenizer.stream();
+    let mut emitted = Vec::new();
+    for byte in "🦊".as_bytes() {
+        emitted.push(stream.push(13 + i32::from(*byte)).unwrap());
+    }
+    assert_eq!(
+        emitted,
+        vec!["".to_string(), "".into(), "".into(), "🦊".into()]
+    );
+    assert_eq!(stream.finish(), "");
+}
+
+#[test]
+fn stream_strips_only_the_first_synthetic_space_of_a_fragment() {
+    // 空格标记由三个 byte token 拼出：第三段攒成完整的 "▁"→" "，作为片段
+    // 开头的合成空格被剥掉（本步输出为空），后面的 "a" 不能再被剥。
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(true)).unwrap();
+    let ids: Vec<i32> = [0xE2u8, 0x96, 0x81]
+        .into_iter()
+        .map(|byte| 13 + i32::from(byte))
+        .chain(std::iter::once(4))
+        .collect();
+    let mut stream = tokenizer.stream();
+    let mut chunks: Vec<String> = Vec::new();
+    for &id in &ids {
+        chunks.push(stream.push(id).unwrap());
+    }
+    chunks.push(stream.finish());
+    assert_eq!(
+        chunks,
+        vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            "a".into(),
+            String::new()
+        ]
+    );
+    assert_eq!(
+        stream_all(&tokenizer, &ids),
+        tokenizer.decode(&ids).unwrap()
+    );
+}
+
+#[test]
+fn stream_flushes_special_tokens_and_resumes_the_next_fragment() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(true)).unwrap();
+    let text = "  ab</s> 中文🦊  ";
+    let ids = tokenizer.encode_with_options(text, &no_special()).unwrap();
+    assert_eq!(stream_all(&tokenizer, &ids), text);
+}
+
+#[test]
+fn stream_rejects_out_of_range_ids() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    let mut stream = tokenizer.stream();
+    let error = stream.push(999).unwrap_err();
+    assert!(error.contains("out of range"), "{error}");
+    // 失败的 token 不得留下半成品：整段仍可正常继续。
+    assert_eq!(stream.finish(), "");
+    let ids = [4, 5];
+    assert_eq!(
+        stream_all(&tokenizer, &ids),
+        tokenizer.decode(&ids).unwrap()
+    );
+}
+
+#[test]
+fn stream_finish_can_be_called_twice() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    let mut stream = tokenizer.stream();
+    assert_eq!(stream.push(4).unwrap(), "a");
+    assert_eq!(stream.finish(), "");
+    assert_eq!(stream.finish(), "");
+}
+
 #[test]
 fn spm_empty_prompt_still_adds_bos() {
     let tokenizer = Tokenizer::from_gguf(&spm_gguf(true)).unwrap();

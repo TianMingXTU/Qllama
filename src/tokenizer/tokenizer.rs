@@ -382,14 +382,28 @@ impl Tokenizer {
         Ok(text)
     }
 
+    /// 逐 token 增量解码，语义与 [`Tokenizer::decode`] 完全一致。
+    pub fn stream(&self) -> StreamingDecoder<'_> {
+        StreamingDecoder {
+            tokenizer: self,
+            pending: Vec::new(),
+            at_fragment_head: true,
+        }
+    }
+
     fn decode_fragment(&self, bytes: &[u8]) -> String {
         // 空格标记也可能由三个 byte token 组成，必须在完整片段解码后恢复。
         let text = String::from_utf8_lossy(bytes).replace('▁', " ");
-        if matches!(self.model, TokenizerModel::Spm { .. }) && self.add_space_prefix {
+        if self.strips_synthetic_space() {
             text.strip_prefix(' ').unwrap_or(&text).to_string()
         } else {
             text
         }
+    }
+
+    /// 片段开头的单个空格是否为 encode 注入的合成前缀（须剥掉）。
+    pub(crate) fn strips_synthetic_space(&self) -> bool {
+        matches!(self.model, TokenizerModel::Spm { .. }) && self.add_space_prefix
     }
 
     /// 单个 token 的原始字节；多字节字符可能跨 token，调用方须缓冲后解码。
@@ -554,6 +568,115 @@ impl Tokenizer {
 enum Segment {
     Special(i32),
     Text(String),
+}
+
+/// 逐 token 增量解码器，由 [`Tokenizer::stream`] 创建。
+///
+/// 与一次性 [`Tokenizer::decode`] 共享同一套片段规则：连续普通 token 攒成一个
+/// 片段，`▁` 一律还原为空格，SPM 片段开头的合成空格剥掉一次；特殊 token 断开
+/// 片段并原样输出字面文本。差别只在时机——跨 token 拆散的多字节字符会留在缓冲里
+/// 等后续 token，凑齐一个完整字符才输出，因此流式输出永远不会吐出半个字符。
+/// 依次拼接 `push` 的返回值、最后接上 `finish`，结果与 `decode` 逐字符相同。
+pub struct StreamingDecoder<'tokenizer> {
+    tokenizer: &'tokenizer Tokenizer,
+    /// 当前片段中尚未输出的字节。
+    pending: Vec<u8>,
+    /// 本片段还没解析出过任何字符：决定首个字符要不要当合成空格剥掉。
+    at_fragment_head: bool,
+}
+
+impl StreamingDecoder<'_> {
+    /// 喂入一个 token，返回立即可安全输出的文本（可能为空）。
+    pub fn push(&mut self, id: i32) -> Result<String, String> {
+        let index = self.tokenizer.check_id_range(id)?;
+        let piece = self.tokenizer.token_bytes(id)?;
+        if matches!(
+            self.tokenizer.token_types[index],
+            TokenType::Control | TokenType::UserDefined | TokenType::Unknown
+        ) {
+            // 特殊 token 自成一节：先把片段收尾，再原样输出标记文本。
+            let mut text = self.finish();
+            text.push_str(&String::from_utf8_lossy(&piece));
+            return Ok(text);
+        }
+        self.pending.extend_from_slice(&piece);
+        Ok(self.drain())
+    }
+
+    /// 片段结束：吐出剩余字节，按 `decode` 的 lossy 语义渲染凑不齐的尾部并复位。
+    ///
+    /// 可重复调用；无待输出内容时返回空串。
+    pub fn finish(&mut self) -> String {
+        let mut text = self.drain();
+        if !self.pending.is_empty() {
+            let tail = String::from_utf8_lossy(&self.pending).into_owned();
+            self.pending.clear();
+            text.push_str(&resolve(
+                &tail,
+                &mut self.at_fragment_head,
+                self.tokenizer.strips_synthetic_space(),
+            ));
+        }
+        self.at_fragment_head = true;
+        text
+    }
+
+    /// 把缓冲里已能定论的字节转成文本，留下一段可能是后续 token 前缀的尾巴。
+    ///
+    /// 每轮对 `pending[consumed..]` 重新做一次 UTF-8 校验：`valid_up_to` 之前的
+    /// 字节必然合法，先吐出再继续；确定无法构成合法序列的字节（`error_len` 为
+    /// `Some(n)`）按 lossy 语义出一个 U+FFFD 并跳过；`error_len` 为 `None` 说明
+    /// 剩余字节可能是下一个 token 才补全的前缀，原样保留、结束本轮。缓冲里合法
+    /// 段、非法序列、不完整尾三类可能交错出现，所以要逐段推进，不能只截尾部。
+    fn drain(&mut self) -> String {
+        let strips = self.tokenizer.strips_synthetic_space();
+        let mut text = String::new();
+        let mut consumed = 0usize;
+        loop {
+            let rest = &self.pending[consumed..];
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(&resolve(valid, &mut self.at_fragment_head, strips));
+                    consumed += valid.len();
+                    break;
+                }
+                Err(error) if error.valid_up_to() > 0 => {
+                    let head = &rest[..error.valid_up_to()];
+                    let valid = std::str::from_utf8(head).expect("valid_up_to 之前的字节必然合法");
+                    text.push_str(&resolve(valid, &mut self.at_fragment_head, strips));
+                    consumed += head.len();
+                }
+                Err(error) => match error.error_len() {
+                    Some(bad) => {
+                        text.push_str(&resolve("\u{FFFD}", &mut self.at_fragment_head, strips));
+                        consumed += bad;
+                    }
+                    None => break,
+                },
+            }
+        }
+        self.pending.drain(..consumed);
+        text
+    }
+}
+
+/// 还原一截已定论的片段文本：`▁` 换空格，片段开头的合成空格剥掉一次。
+///
+/// `head` 表示这截是否位于片段开头；一旦吐出过任何字符就转为 false，因此
+/// 一个片段最多剥一个空格，与 [`Tokenizer::decode`] 的 `strip_prefix` 一致。
+fn resolve(text: &str, head: &mut bool, strips_synthetic_space: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let resolved = if ch == '▁' { ' ' } else { ch };
+        if *head {
+            *head = false;
+            if resolved == ' ' && strips_synthetic_space {
+                continue;
+            }
+        }
+        out.push(resolved);
+    }
+    out
 }
 
 /// 把文本按特殊 token 的出现位置切成片段。

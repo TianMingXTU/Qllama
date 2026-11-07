@@ -1,8 +1,10 @@
 use clap::{CommandFactory, Parser};
+use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use qllama::sampler::{Sampler, SamplerConfig};
-use qllama::tokenizer::{EncodeOptions, Tokenizer};
+use qllama::tokenizer::{EncodeOptions, StreamingDecoder, Tokenizer};
 use qllama::transformer::Transformer;
 
 /// Qllama: A Rust-native LLM inference engine
@@ -60,6 +62,24 @@ struct Args {
     #[arg(long, value_name = "SEED")]
     seed: Option<u64>,
 
+    /// Context budget in positions; defaults to the model's context_length
+    ///
+    /// 同时决定 KV cache 容量与生成上限。超出模型标称值会被拒绝。
+    #[arg(long, value_name = "N")]
+    ctx_size: Option<NonZeroUsize>,
+
+    /// Worker threads for the matrix products; defaults to the CPU count
+    ///
+    /// 只影响并行划分，不改变每个输出的累加顺序，因此同参数下结果逐位一致。
+    #[arg(long, value_name = "N")]
+    threads: Option<NonZeroUsize>,
+
+    /// Buffer the whole generated text and print it after generation
+    ///
+    /// 默认逐 token 流式输出；--logits 与采样参数不受影响。
+    #[arg(long)]
+    no_stream: bool,
+
     /// Do not prepend the BOS token to the encoded prompt
     #[arg(long)]
     no_bos: bool,
@@ -79,6 +99,21 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // --threads 只影响 matmul 的并行划分，不改累加顺序；显式局部池与
+    // bench_inference 一致，避免污染全局池语义。默认路径不动任何既有行为。
+    match args.threads {
+        Some(threads) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads.get())
+                .build()
+                .map_err(anyhow::Error::msg)?;
+            pool.install(|| run(&args))
+        }
+        None => run(&args),
+    }
+}
+
+fn run(args: &Args) -> anyhow::Result<()> {
     let Some(model_path) = &args.model else {
         // 直接复用 clap 渲染的帮助文本：手写一份 usage 必然与 --help 慢慢不一致。
         Args::command().print_help()?;
@@ -201,6 +236,31 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 上下文预算在第一次前向之前算清并校验：跑到一半才发现放不下，前面的
+    // token 已经吐给用户了，收都收不回。
+    let ctx_size = match args.ctx_size {
+        Some(requested) => {
+            let requested = requested.get();
+            if requested > config.max_position_embeddings {
+                anyhow::bail!(
+                    "--ctx-size {requested} exceeds the model's context length {}",
+                    config.max_position_embeddings
+                );
+            }
+            requested
+        }
+        None => config.max_position_embeddings,
+    };
+    if prompt_ids.len() >= ctx_size && args.generate > 0 {
+        anyhow::bail!(
+            "Context budget exceeded: {} prompt tokens already fill --ctx-size {ctx_size}; \
+             there is no room for a new token. Raise --ctx-size (model maximum {}), \
+             shorten the prompt, or pass --no-bos.",
+            prompt_ids.len(),
+            config.max_position_embeddings
+        );
+    }
+
     let logits = model.forward(&prompt_ids, 0).map_err(anyhow::Error::msg)?;
     let (last_row, shape) = last_position_row(&logits)?;
     println!("\n=== Forward ===");
@@ -248,6 +308,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.generate > 0 {
+        // 放不下的部分收缩到预算：静默少生成会被当成模型输出就这么短，所以
+        // 生成结束后用 budget_limited 在停止原因里明说。ctx_size 已校验。
+        let steps = args.generate.min(ctx_size - prompt_ids.len());
+        let budget_limited = steps < args.generate;
+
         let sampler_config = SamplerConfig {
             temperature: args.temperature,
             top_k: args.top_k,
@@ -260,17 +325,96 @@ fn main() -> anyhow::Result<()> {
         };
         // 只有 --prompt 路径才有分词器，也就才知道 EOS 是哪个 id。
         let eos_id = tokenizer.as_ref().and_then(Tokenizer::eos_id);
-        let generated = generate(&model, &mut sampler, &prompt_ids, args.generate, eos_id)?;
-        println!("\n=== Generation ===");
+        // 输出方式三选一：流式（默认，有分词器）、缓冲（--no-stream）、纯 id。
+        let mut stream = tokenizer.as_ref().map(Tokenizer::stream);
+        let output = match (&mut stream, args.no_stream) {
+            (Some(decoder), false) => OutputMode::Stream(decoder),
+            (Some(_), true) => OutputMode::Buffered,
+            (None, _) => OutputMode::IdsOnly,
+        };
+        let text_output = output.streams_text();
+        if text_output {
+            println!("\n=== Generation ===");
+            std::io::stdout().flush()?;
+        }
+        let outcome = generate(
+            &model,
+            &mut sampler,
+            &prompt_ids,
+            steps,
+            ctx_size,
+            eos_id,
+            output,
+        )?;
+        // generate 只见到收缩后的步数；"被预算截断"这个事实只有调用方知道。
+        let stop_reason = if outcome.stop_reason == StopReason::ContextBudget
+            || (budget_limited && outcome.stop_reason == StopReason::RequestedLimit)
+        {
+            StopReason::ContextBudget
+        } else {
+            outcome.stop_reason
+        };
+        if text_output {
+            println!("\n=== Generation summary ===");
+        } else {
+            println!("\n=== Generation ===");
+        }
         println!("  prompt ids: {prompt_ids:?}");
-        println!("  generated {} token(s): {generated:?}", generated.len());
+        println!(
+            "  generated {} token(s): {:?}",
+            outcome.tokens.len(),
+            outcome.tokens
+        );
+        println!("  {stop_reason}");
         if let Some(tokenizer) = &tokenizer {
-            let text = tokenizer.decode(&generated).map_err(anyhow::Error::msg)?;
-            println!("  text: {text:?}");
+            if args.no_stream {
+                let text = tokenizer
+                    .decode(&outcome.tokens)
+                    .map_err(anyhow::Error::msg)?;
+                println!("  text: {text:?}");
+            }
+        } else {
+            println!("  (no tokenizer metadata; the ids above are the output, not text)");
         }
     }
 
     Ok(())
+}
+
+/// 生成循环结束时可观察到的原因。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// 用满 --generate 请求的步数。
+    RequestedLimit,
+    /// 采到 EOS，提前结束。
+    EndOfSequence,
+    /// 上下文预算耗尽（收缩后的步数跑完，或 --ctx-size 只够这些）。
+    ContextBudget,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RequestedLimit => {
+                write!(formatter, "stopped after the requested --generate limit")
+            }
+            Self::EndOfSequence => {
+                write!(
+                    formatter,
+                    "stopped at end-of-sequence before the --generate limit"
+                )
+            }
+            Self::ContextBudget => write!(
+                formatter,
+                "reached the context budget (--ctx-size) before the --generate limit"
+            ),
+        }
+    }
+}
+
+struct GenerationOutcome {
+    tokens: Vec<i32>,
+    stop_reason: StopReason,
 }
 
 /// 解析 token id 列表：含逗号时按逗号切，否则按空白切。
@@ -367,6 +511,22 @@ fn top_k(row: &[f32], k: usize) -> Vec<(usize, f32)> {
         .collect()
 }
 
+/// 生成的输出方式：由分词器有无与 --no-stream 共同决定。
+///
+/// 流式路径每采出一个 token 就立即解码写出；缓冲路径保持旧契约，生成结束后
+/// 打印 `text:` 行；id 路径没有分词器，没有文本可吐，只输出 id 摘要。
+enum OutputMode<'a> {
+    Stream(&'a mut StreamingDecoder<'a>),
+    Buffered,
+    IdsOnly,
+}
+
+impl OutputMode<'_> {
+    fn streams_text(&self) -> bool {
+        matches!(self, Self::Stream(_))
+    }
+}
+
 /// 采样生成：prefill 整段 prompt，之后每步只前向一个新 token。
 ///
 /// 两阶段结构对应 KV Cache 的两种用法：
@@ -375,39 +535,36 @@ fn top_k(row: &[f32], k: usize) -> Vec<(usize, f32)> {
 /// 2. decode：之后每步只喂单个新 token，`start_pos` 随已生成长度前进，
 ///    K/V 与 cache 中的历史拼接——每步代价从 O(n²) 降到 O(n)。
 ///
-/// cache 按模型配置在函数内构造一次：容量取 `max_position_embeddings`，
-/// KV 头数取 `num_kv_heads`（GQA 下不是 query 头数，见 `KvCache::new`）。
-/// 注意这是按标称最大上下文预分配：7B 级 MHA 模型（32 层 × 2048 × 32 KV 头 ×
-/// 128 维 × K/V × f32）约 2 GB，即使只生成几个 token 也会先付出这笔内存。
-/// 需要小量生成时，容量可安全地缩到 `prompt.len() + steps`（本阶段为对齐
-/// 任务书语义保持最大容量，不做收缩）。
+/// cache 按 `ctx_size` 预算分配（CLI 已保证不超过模型标称值，也保证
+/// prompt.len() + steps 放得下）；容量语义见 `KvCache::new`。
 ///
 /// `eos_id` 给出时，遇到它立即停止且不计入生成结果——llama.cpp 同样不把 EOS
-/// 计入输出文本。`None` 表示模型没有 EOS，生成到上限为止。
+/// 计入输出文本。`None` 表示模型没有 EOS，生成到 `steps` 为止。"steps 被上下文
+/// 预算收缩过"只有调用方知道，停止原因由调用方最终裁定；这里只区分
+/// EOS 提前停止与跑满请求步数。
 fn generate(
     model: &Transformer,
     sampler: &mut Sampler,
     prompt: &[i32],
     steps: usize,
+    ctx_size: usize,
     eos_id: Option<i32>,
-) -> anyhow::Result<Vec<i32>> {
+    mut output: OutputMode<'_>,
+) -> anyhow::Result<GenerationOutcome> {
     let config = model.config();
     let mut kv_cache = qllama::kv_cache::KvCache::new(
         config.num_layers,
-        config.max_position_embeddings,
+        ctx_size,
         config.num_kv_heads,
         config.head_dim(),
     );
 
     let mut ids = prompt.to_vec();
-    // 预分配按实际可能生成的上限截断：位置守卫保证最多生成到上下文容量，
-    // 因此 steps 再离谱也不会超过 max_position_embeddings。直接按 steps
-    // 预分配会让 `--generate 1000000000000` 在申请 4 TB 时被分配器 abort，
-    // 连"上下文放不下"的可读错误都走不到。
-    let mut generated = Vec::with_capacity(steps.min(config.max_position_embeddings));
+    let mut generated = Vec::with_capacity(steps);
     // 第一批是整段 prompt（位置 0 起），之后每批只有一个新 token。
     let mut batch = prompt.to_vec();
     let mut position = 0usize;
+    let mut stop_reason = StopReason::RequestedLimit;
     for _ in 0..steps {
         let logits = model
             .forward_with_cache(&batch, position, &mut kv_cache)
@@ -418,14 +575,38 @@ fn generate(
             .sample_slice(last_row, &ids)
             .map_err(anyhow::Error::msg)?;
         if Some(next) == eos_id {
+            stop_reason = StopReason::EndOfSequence;
             break;
         }
         generated.push(next);
         ids.push(next);
+        if let OutputMode::Stream(decoder) = &mut output {
+            let text = decoder.push(next).map_err(anyhow::Error::msg)?;
+            write_stdout(&text)?;
+        }
         position += batch.len();
         batch = vec![next];
     }
-    Ok(generated)
+    if let OutputMode::Stream(decoder) = &mut output {
+        // 收尾：把解码器里可能滞留的不完整序列按 lossy 语义吐出，避免结尾
+        // 少字。EOS 停止时片段早已 flush，这里只是幂等的第二次 flush。
+        let tail = decoder.finish();
+        if !tail.is_empty() {
+            write_stdout(&tail)?;
+        }
+    }
+    Ok(GenerationOutcome {
+        tokens: generated,
+        stop_reason,
+    })
+}
+
+/// 流式正文逐 token 写出并立即 flush；这是"流式"与"结束后打印"的本质区别。
+fn write_stdout(text: &str) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// 单条 metadata 值的紧凑展示。

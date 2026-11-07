@@ -2,4 +2,4 @@
 
 mod tokenizer;
 
-pub use tokenizer::{EncodeOptions, TokenType, Tokenizer};
+pub use tokenizer::{EncodeOptions, StreamingDecoder, TokenType, Tokenizer};

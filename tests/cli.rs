@@ -490,13 +490,22 @@ fn token_list_accepts_both_commas_and_whitespace() {
 #[test]
 fn prompt_is_encoded_and_generated_text_is_printed() {
     // --prompt 是文字生成闭环的主入口：文本进、token id 出、再解码回文本。
+    // 默认走流式；--no-stream 保留"生成结束后一次性打印 text:"的旧契约。
     let dir = fixture_dir("prompt-generate");
     let model = dir.join("tiny-llama.gguf");
     write_fixture(&model);
 
     let output = run_cli(
         &model,
-        &["--prompt", "tok5", "--generate", "3", "--temperature", "0"],
+        &[
+            "--prompt",
+            "tok5",
+            "--generate",
+            "3",
+            "--temperature",
+            "0",
+            "--no-stream",
+        ],
     );
     assert!(
         output.status.success(),
@@ -517,6 +526,88 @@ fn prompt_is_encoded_and_generated_text_is_printed() {
     assert!(stdout.contains("text:"), "应打印解码后的文本:\n{stdout}");
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn streamed_generation_matches_the_one_shot_decode() {
+    // 流式是默认路径：逐 token 输出的正文必须与对同一串 id 一次性 decode 的
+    // 结果完全一致，且旧的 "text:" 缓冲行不再重复打印。
+    let dir = fixture_dir("stream-generation");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(
+        &model,
+        &["--prompt", "tok5", "--generate", "3", "--temperature", "0"],
+    );
+    assert!(
+        output.status.success(),
+        "退出码应为 0: {:?}\n{}",
+        output.status,
+        stdout_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    let body = streamed_body(&stdout);
+    // 只看摘要段：Forward 段本来就有一行 "input text:"，那不是缓冲的生成文本。
+    let summary = stdout
+        .split("=== Generation summary ===")
+        .nth(1)
+        .expect("流式模式应打印生成摘要");
+    assert!(
+        !summary.contains("text:"),
+        "流式模式不应再打印缓冲 text: 行:\n{summary}"
+    );
+    assert!(
+        summary.contains("stopped after the requested --generate limit"),
+        "摘要应说明停止原因:\n{summary}"
+    );
+
+    // 期望值用库侧独立计算：同一夹具、同一 decode 契约。
+    let gguf = GgufFile::from_path(&model).expect("读取夹具失败");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("加载分词器失败");
+    let ids = generated_ids(&stdout);
+    assert_eq!(
+        body,
+        tokenizer.decode(&ids).expect("解码生成 id 失败"),
+        "流式正文应与一次性 decode 一致"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// 提取流式正文：`=== Generation ===` 段头之后、`=== Generation summary ===`
+/// 之前的全部文本（去掉结尾为可读性补的换行）。
+fn streamed_body(stdout: &str) -> String {
+    let after_header = stdout
+        .split("=== Generation ===\n")
+        .nth(1)
+        .expect("输出应包含 Generation 段");
+    let body = after_header
+        .split("=== Generation summary ===")
+        .next()
+        .expect("流式输出后应有摘要段");
+    body.strip_suffix('\n').unwrap_or(body).to_string()
+}
+
+/// 解析 "generated N token(s): [a, b, c]" 中的 id 列表，逐元素比对而不是
+/// 子串匹配——子串会把 id 11 误判成 id 1。
+fn generated_ids(stdout: &str) -> Vec<i32> {
+    let line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("generated "))
+        .expect("输出缺少 generated 行");
+    let list = line
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(inside, _)| inside.trim())
+        .expect("generated 行应给出 id 列表");
+    if list.is_empty() {
+        Vec::new()
+    } else {
+        list.split(',')
+            .map(|value| value.trim().parse::<i32>().expect("id 应可解析"))
+            .collect()
+    }
 }
 
 #[test]
@@ -782,38 +873,155 @@ fn generation_stops_early_when_the_model_emits_eos() {
 
     let output = run_cli(
         &model,
-        &["--prompt", "tok5", "--generate", "46", "--temperature", "0"],
+        &[
+            "--prompt",
+            "tok5",
+            "--generate",
+            "46",
+            "--temperature",
+            "0",
+            "--no-stream",
+        ],
     );
     assert!(output.status.success(), "退出码应为 0: {:?}", output.status);
     let stdout = stdout_of(&output);
-    let generated = stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("generated "))
-        .expect("输出缺少 generated 行");
-    // 解析 "generated N token(s): [a, b, c]" 里的 id 列表，逐个比对而不是
-    // 匹配子串——子串匹配会把 id 11 误判成 id 1。
-    let list = generated
-        .split_once('[')
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .map(|(inside, _)| inside.trim())
-        .expect("generated 行应给出 id 列表");
-    let ids: Vec<i32> = if list.is_empty() {
-        Vec::new()
-    } else {
-        list.split(',')
-            .map(|value| value.trim().parse::<i32>().expect("id 应可解析"))
-            .collect()
-    };
+    let ids = generated_ids(&stdout);
     // 提前停止的直接证据：生成数严格小于请求的上限。仅靠循环上限不可能
     // 产生这个结果——若 EOS 停止被移除，这里会生成满 46 个并失败。
     assert!(
         ids.len() < 46,
-        "应在采到 EOS 时提前停止（生成数应严格小于 46）: {generated}"
+        "应在采到 EOS 时提前停止（生成数应严格小于 46）:\n{stdout}"
     );
     assert!(
         !ids.contains(&1),
-        "EOS(id 1) 不应出现在生成结果里: {generated}"
+        "EOS(id 1) 不应出现在生成结果里:\n{stdout}"
     );
+    // 停止原因必须显式：只报"生成了 43 个"会让使用者以为请求被截断了。
+    assert!(
+        stdout.contains("stopped at end-of-sequence"),
+        "应报告 EOS 停止:\n{stdout}"
+    );
+}
+
+#[test]
+fn ctx_size_smaller_than_the_prompt_is_rejected_before_the_forward() {
+    // 放不下就是放不下：必须在前向之前显式报错并说明差额，而不是跑半截再
+    // 被 KV cache 的越界信息打断。
+    let dir = fixture_dir("ctx-too-small");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(
+        &model,
+        &[
+            "--tokens",
+            "1,2,3,4,5,6",
+            "--generate",
+            "4",
+            "--ctx-size",
+            "6",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "prompt + 生成超出 --ctx-size 应以非零码退出"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--ctx-size 6") && stderr.contains("6 prompt tokens"),
+        "错误信息应给出预算与需求: {stderr}"
+    );
+    assert!(
+        !stdout_of(&output).contains("=== Forward ==="),
+        "预算检查必须先于前向:\n{}",
+        stdout_of(&output)
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn ctx_size_larger_than_the_model_maximum_is_rejected() {
+    let dir = fixture_dir("ctx-too-large");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(&model, &["--tokens", "1", "--ctx-size", "1024"]);
+    assert!(!output.status.success(), "超出模型标称上下文应报错");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1024") && stderr.contains("128"),
+        "错误信息应同时给出请求值与模型上限: {stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn ctx_size_limits_generation_and_says_so() {
+    // 夹具标称上下文 128。把 --ctx-size 压到刚好放得下 prompt+3 个新 token，
+    // 第 4 步必须由预算检查拦下并说明原因；不能静默少生成。
+    let dir = fixture_dir("ctx-limited");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(
+        &model,
+        &[
+            "--tokens",
+            "1,2",
+            "--generate",
+            "10",
+            "--ctx-size",
+            "5",
+            "--no-stream",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "预算内生成完成后应正常退出: {:?}\n{}",
+        output.status,
+        stdout_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    let ids = generated_ids(&stdout);
+    assert_eq!(ids.len(), 3, "只应生成预算允许的 3 个 token:\n{stdout}");
+    assert!(
+        stdout.contains("reached the context budget"),
+        "应报告上下文耗尽:\n{stdout}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn thread_count_does_not_change_the_output() {
+    // 线程数只影响 matmul 的划分方式，不影响每个输出的累加顺序（见
+    // MappedWeight::matmul 的注释），因此结果必须逐字节一致。
+    let dir = fixture_dir("threads-parity");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let base = ["--prompt", "tok5", "--generate", "4", "--temperature", "0"];
+    let one = stdout_of(&run_cli(&model, &[&base[..], &["--threads", "1"]].concat()));
+    let many = stdout_of(&run_cli(&model, &[&base[..], &["--threads", "4"]].concat()));
+    assert_eq!(one, many, "--threads 不应改变输出");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn zero_threads_is_rejected_by_the_argument_parser() {
+    let dir = fixture_dir("threads-zero");
+    let model = dir.join("tiny-llama.gguf");
+    write_fixture(&model);
+
+    let output = run_cli(&model, &["--tokens", "1", "--threads", "0"]);
+    assert!(!output.status.success(), "--threads 0 应被拒绝");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--threads"), "错误应指向参数: {stderr}");
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
