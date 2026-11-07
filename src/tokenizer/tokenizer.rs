@@ -1,17 +1,8 @@
-//! Tokenizer：自然语言文本 ↔ token id 序列。
+//! GGUF 分词：Llama SPM 使用词表分数，GPT-2/StarCoder 保留现有 merges 路径。
 //!
-//! ⚠️ 已知限制（对照 llama.cpp `src/llama-vocab.cpp` 的完整实现）：
-//! 1. 真实 Llama GGUF（SPM）没有 `tokenizer.ggml.merges` 而用
-//!    `tokenizer.ggml.scores` 驱动合并；本阶段不实现 scores 驱动的 SPM 合并，
-//!    对无 merges 的文件退化为"逐字符 + byte fallback"——编码粒度与
-//!    llama.cpp 不同，但 id 总能产生、encode→decode 往返闭合。
-//! 2. 特殊 token 切分对全部 Control/UserDefined/Unknown 类 token 生效，
-//!    没有 llama.cpp 的 `parse_special` 开关。
-//! 3. decode 对 byte token（`<0xXX>`）直接输出其文本形式，不做字节级
-//!    UTF-8 重组——llama.cpp 的 detokenize 同样逐 token 拼接，多字节字符
-//!    由调用方拼接后才合法；`decode(encode("中"))` 会得到
-//!    `"<0xE4><0xB8><0xAD>"` 而非 `"中"`。
-//! 4. 未实现 precompiled_charsmap（NFC 归一化）等归一化步骤。
+//! 特殊 token 按最长字面匹配切分；decode 保留其字面文本。解码先拼接 byte
+//! token 的原始字节，再统一转换 UTF-8；不完整或非法序列使用 U+FFFD，避免把
+//! 多字节字符的每个 byte token 分别解码。模型需要的额外归一化若未实现则报错。
 
 use std::collections::HashMap;
 
@@ -64,9 +55,16 @@ impl Default for EncodeOptions {
     }
 }
 
-/// BPE 分词器：从 GGUF 元数据加载词表与合并表。
+#[derive(Debug, Clone)]
+enum TokenizerModel {
+    Spm { scores: Vec<f32> },
+    MergeBpe,
+}
+
+/// 从 GGUF 元数据加载的词表与分词算法。
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
+    model: TokenizerModel,
     token_to_id: HashMap<String, i32>,
     id_to_token: Vec<String>,
     /// 原始 merges 表（调试与展示用）；合并优先级看 [`Self::merge_ranks`]。
@@ -91,6 +89,7 @@ impl Tokenizer {
     /// 空分词器：没有词表，encode/decode 自然报错。
     pub fn new() -> Self {
         Self {
+            model: TokenizerModel::MergeBpe,
             token_to_id: HashMap::new(),
             id_to_token: Vec::new(),
             merges: Vec::new(),
@@ -106,21 +105,44 @@ impl Tokenizer {
     /// 从 GGUF 元数据构造分词器。
     ///
     /// 键名与上游 llama.cpp `src/llama-arch.cpp` 的 LLM_KV_NAMES 表一致。
-    /// `tokenizer.ggml.model` 与 `tokenizer.ggml.tokens` 必填；merges、
-    /// token_type、bos/eos/unknown id、add_space_prefix 可选。可选键存在但
+    /// `tokenizer.ggml.model` 与 `tokenizer.ggml.tokens` 必填；Llama SPM 还要求
+    /// 与词表等长的有限 Float32 scores。merges、token_type、bos/eos/unknown id、
+    /// add_space_prefix 可选。可选键存在但
     /// 类型或范围非法时报错——"缺失"与"写坏"必须区分，写坏的文件不能蒙混。
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, String> {
         let metadata = &gguf.metadata;
 
-        // model 键必填（如 "llama"），但本阶段统一用 BPE-with-merges 算法，
-        // 不按类型分派——值只做存在性校验。
-        metadata
-            .get("tokenizer.ggml.model")
-            .and_then(|v| match v {
-                GgufValue::String(_) => Some(()),
-                _ => None,
-            })
-            .ok_or_else(|| "Missing or invalid metadata key: tokenizer.ggml.model".to_string())?;
+        let model_name = match metadata.get("tokenizer.ggml.model") {
+            Some(GgufValue::String(name))
+                if matches!(name.as_str(), "llama" | "gpt2" | "starcoder") =>
+            {
+                name.as_str()
+            }
+            Some(GgufValue::String(name)) => {
+                return Err(format!(
+                    "Unsupported tokenizer model {name:?}; supported: llama, gpt2, starcoder"
+                ))
+            }
+            _ => return Err("Missing or invalid metadata key: tokenizer.ggml.model".to_string()),
+        };
+        if metadata.contains_key("tokenizer.ggml.precompiled_charsmap") {
+            return Err("Unsupported tokenizer normalization: precompiled_charsmap".to_string());
+        }
+        match metadata.get("tokenizer.ggml.remove_extra_whitespaces") {
+            None | Some(GgufValue::Bool(false)) => {}
+            Some(GgufValue::Bool(true)) => {
+                return Err(
+                    "Unsupported tokenizer normalization: remove_extra_whitespaces=true"
+                        .to_string(),
+                )
+            }
+            Some(_) => {
+                return Err(
+                    "Invalid metadata type: tokenizer.ggml.remove_extra_whitespaces must be Bool"
+                        .to_string(),
+                )
+            }
+        }
 
         let tokens: Vec<String> = read_string_array(metadata, "tokenizer.ggml.tokens")?;
         if tokens.is_empty() {
@@ -235,7 +257,35 @@ impl Tokenizer {
             }
         };
 
+        let model = if model_name == "llama" {
+            let items = match metadata.get("tokenizer.ggml.scores") {
+                Some(GgufValue::Array(items)) if items.len() == tokens.len() => items,
+                _ => return Err("Metadata key tokenizer.ggml.scores must contain one Float32 score per token for llama SPM".to_string()),
+            };
+            let scores = items
+                .iter()
+                .enumerate()
+                .map(|(index, value)| match value {
+                    GgufValue::Float32(score) if score.is_finite() => Ok(*score),
+                    _ => Err(format!(
+                        "Metadata key tokenizer.ggml.scores has invalid score at index {index}"
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            TokenizerModel::Spm { scores }
+        } else {
+            TokenizerModel::MergeBpe
+        };
+        for (index, token_type) in token_types.iter().take(tokens.len()).enumerate() {
+            if *token_type == TokenType::Byte && byte_value(&tokens[index]).is_none() {
+                return Err(format!(
+                    "Invalid byte token {:?} at index {index}; expected <0xXX>",
+                    tokens[index]
+                ));
+            }
+        }
         Ok(Self {
+            model,
             token_to_id,
             id_to_token: tokens,
             merges,
@@ -276,11 +326,16 @@ impl Tokenizer {
         options: &EncodeOptions,
     ) -> Result<Vec<i32>, String> {
         let mut ids = Vec::new();
-        // 特殊 token 切分后再逐普通段进 BPE；段间顺序即文本顺序。
+        // 特殊 token 隔开普通片段，片段之间不合并。
         for segment in split_special_tokens(self, text) {
             match segment {
                 Segment::Special(id) => ids.push(id),
-                Segment::Text(text) => ids.extend(self.encode_bpe_segment(&text)?),
+                Segment::Text(text) => match &self.model {
+                    TokenizerModel::Spm { scores } => {
+                        ids.extend(self.encode_spm_segment(&text, scores)?)
+                    }
+                    TokenizerModel::MergeBpe => ids.extend(self.encode_bpe_segment(&text)?),
+                },
             }
         }
 
@@ -299,27 +354,107 @@ impl Tokenizer {
         Ok(ids)
     }
 
-    /// 解码 id 序列为文本。
+    /// 解码 id 序列；特殊标记保留字面文本，`▁` 还原为空格。
     ///
-    /// Control/UserDefined 等特殊 token 原样输出其文本（`<s>` 之类），普通
-    /// token 把 `▁` 还原为空格；byte token 直接输出 `<0xXX>` 文本形式
-    /// （模块头限制 3）。
+    /// byte token 先拼成原始字节，再统一 UTF-8 解码；非法序列使用 U+FFFD。
+    /// SPM 每段普通文本前的 dummy 空格在此移除；与 encode(add_bos=false) 往返
+    /// 可恢复原文，字面 U+2581 与空格发生归一化碰撞时除外。自动 BOS 不会被
+    /// 删除，因它与输入中的字面 BOS 无法区分。
+    /// llama.cpp 的底层接口返回原始字节；需要该契约时使用 token_bytes。
     pub fn decode(&self, tokens: &[i32]) -> Result<String, String> {
         let mut text = String::new();
+        let mut fragment = Vec::new();
         for &id in tokens {
             let index = self.check_id_range(id)?;
-            let token_text = &self.id_to_token[index];
-            match self.token_types.get(index) {
-                // 特殊类 token 不做 ▁ 还原：它们的文本是字面标记。
-                Some(TokenType::Control)
-                | Some(TokenType::UserDefined)
-                | Some(TokenType::Unknown) => text.push_str(token_text),
-                _ => {
-                    text.push_str(&token_text.replace('▁', " "));
+            let piece = self.token_bytes(id)?;
+            if matches!(
+                self.token_types[index],
+                TokenType::Control | TokenType::UserDefined | TokenType::Unknown
+            ) {
+                text.push_str(&self.decode_fragment(&fragment));
+                fragment.clear();
+                text.push_str(&String::from_utf8_lossy(&piece));
+            } else {
+                fragment.extend_from_slice(&piece);
+            }
+        }
+        text.push_str(&self.decode_fragment(&fragment));
+        Ok(text)
+    }
+
+    fn decode_fragment(&self, bytes: &[u8]) -> String {
+        // 空格标记也可能由三个 byte token 组成，必须在完整片段解码后恢复。
+        let text = String::from_utf8_lossy(bytes).replace('▁', " ");
+        if matches!(self.model, TokenizerModel::Spm { .. }) && self.add_space_prefix {
+            text.strip_prefix(' ').unwrap_or(&text).to_string()
+        } else {
+            text
+        }
+    }
+
+    /// 单个 token 的原始字节；多字节字符可能跨 token，调用方须缓冲后解码。
+    pub fn token_bytes(&self, id: i32) -> Result<Vec<u8>, String> {
+        let index = self.check_id_range(id)?;
+        let token = &self.id_to_token[index];
+        match self.token_types.get(index) {
+            Some(TokenType::Byte) => byte_value(token)
+                .map(|byte| vec![byte])
+                .ok_or_else(|| format!("Invalid byte token {token:?}")),
+            Some(TokenType::Control | TokenType::UserDefined | TokenType::Unknown) => {
+                Ok(token.as_bytes().to_vec())
+            }
+            _ => Ok(token.replace('▁', " ").into_bytes()),
+        }
+    }
+
+    /// 按 llama.cpp SPM 的分数优先级合并，相同分数取最左相邻对。
+    ///
+    /// 对照 b12110 llama-vocab.cpp:91–231：合并候选只要求拼接文本存在于词表，
+    /// 不过滤 token_type。这里每轮重扫而非保留优先队列，保持同一排序并避免过期项。
+    /// 每次合并结果都在词表中，最终未命中的符号只能是未合并的初始字符，因此可
+    /// 直接按原始 UTF-8 字节 fallback，等价于上游 resegment 的叶子分支。
+    fn encode_spm_segment(&self, text: &str, scores: &[f32]) -> Result<Vec<i32>, String> {
+        let mut normalized = String::new();
+        if self.add_space_prefix && !text.is_empty() {
+            normalized.push('▁');
+        }
+        normalized.push_str(&text.replace(' ', "▁"));
+        let mut symbols: Vec<String> = normalized.chars().map(|c| c.to_string()).collect();
+        loop {
+            let mut best: Option<(f32, usize, String)> = None;
+            for position in 0..symbols.len().saturating_sub(1) {
+                let merged = format!("{}{}", symbols[position], symbols[position + 1]);
+                if let Some(&id) = self.token_to_id.get(&merged) {
+                    let score = scores[id as usize];
+                    if best
+                        .as_ref()
+                        .is_none_or(|(previous, _, _)| score > *previous)
+                    {
+                        best = Some((score, position, merged));
+                    }
+                }
+            }
+            let Some((_, position, merged)) = best else {
+                break;
+            };
+            symbols[position] = merged;
+            symbols.remove(position + 1);
+        }
+        let mut ids = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            if let Some(&id) = self.token_to_id.get(&symbol) {
+                ids.push(id);
+            } else {
+                for byte in symbol.bytes() {
+                    let token = format!("<0x{byte:02X}>");
+                    let id = self.token_to_id.get(&token).ok_or_else(|| {
+                        format!("Cannot encode SPM symbol {symbol:?}: missing byte token {token}")
+                    })?;
+                    ids.push(*id);
                 }
             }
         }
-        Ok(text)
+        Ok(ids)
     }
 
     /// 把一段普通文本走 BPE 流程编码为 id。
@@ -367,13 +502,9 @@ impl Tokenizer {
                 ids.push(id);
                 continue;
             }
-            // ⚠️ 与上游的差异：任务书要求未命中先 unk 再 byte fallback，
-            // 本实现照此执行。llama.cpp 的标准 BPE 从不输出 unk——对未命中
-            // 符号直接逐字节 fallback（llama-vocab.cpp L798-818，unk 分支
-            // 仅 SOPRANO pre-type 生效，unk 输出只存在于 SPM viterbi 路径）。
-            // "带 unk 配置 + 词表缺该符号但有 byte token" 的文件两侧结果
-            // 不同：这里得 unk，上游得 byte token 序列。若后续实现 scores
-            // 驱动的 SPM 合并，需按模型类型分派这条路径。
+            // 保留既有 merges 接口的 UNK 优先契约；它不具备完整 GPT-2
+            // 预分词语义，不能用来声明与上游 GPT-2 tokenizer 对齐。
+            // Llama SPM 由独立分支处理，未命中时直接 byte fallback。
             if let Some(unk) = self.unk_id {
                 ids.push(unk);
                 continue;
@@ -473,6 +604,14 @@ fn split_special_tokens(tokenizer: &Tokenizer, text: &str) -> Vec<Segment> {
         segments = next;
     }
     segments
+}
+
+fn byte_value(token: &str) -> Option<u8> {
+    let hex = token.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
 }
 
 /// 读取字符串数组元数据键。

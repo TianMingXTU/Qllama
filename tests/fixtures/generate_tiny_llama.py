@@ -262,7 +262,7 @@ def build_gguf() -> bytes:
         + [f"tok{i}" for i in range(6, 61)]
     )
     metadata.append(("tokenizer.ggml.tokens", pack_metadata_array(META_TYPE_STRING, tokens)))
-    metadata.append(("tokenizer.ggml.model", pack_metadata_string("llama")))
+    metadata.append(("tokenizer.ggml.model", pack_metadata_string("gpt2")))
     # token_type：0=UNDEFINED 1=NORMAL 2=UNKNOWN 3=CONTROL 4=USER_DEFINED
     # 5=UNUSED 6=BYTE（上游 include/llama.h 的 LLAMA_TOKEN_TYPE 枚举）。
     # <s> 与 </s> 是控制符，其余全是普通文本。

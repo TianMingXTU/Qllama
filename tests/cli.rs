@@ -122,7 +122,7 @@ fn write_fixture_with(path: &Path, with_tokenizer: bool) {
         // merges 让 "tok5" 有确定的编码路径：t+o→to → to+k→tok → tok+5→tok5
         // = id 6。add_space_prefix=false：词表没有 ▁，开着会把前导空格编成 unk。
         metadata.extend([
-            ("tokenizer.ggml.model", Value::Str("llama".to_string())),
+            ("tokenizer.ggml.model", Value::Str("gpt2".to_string())),
             (
                 "tokenizer.ggml.tokens",
                 Value::Tokens(

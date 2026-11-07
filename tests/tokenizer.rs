@@ -77,7 +77,7 @@ const TOKEN_TYPES: [i32; 11] = [3, 3, 1, 1, 1, 1, 1, 1, 1, 6, 1];
 fn build_gguf(extra: &[(&str, GgufValue)]) -> GgufFile {
     let mut metadata: Vec<(&str, GgufValue)> = vec![
         ("general.architecture", GgufValue::String("llama".into())),
-        ("tokenizer.ggml.model", GgufValue::String("llama".into())),
+        ("tokenizer.ggml.model", GgufValue::String("gpt2".into())),
         (
             "tokenizer.ggml.tokens",
             GgufValue::Array(
@@ -344,7 +344,7 @@ fn encode_without_eos_id_ignores_add_eos() {
     let bare_metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -385,7 +385,7 @@ fn missing_tokens_key_is_rejected() {
 #[test]
 fn empty_tokens_array_is_rejected() {
     let error = Tokenizer::from_gguf(&build_gguf_bare(&[
-        ("tokenizer.ggml.model", GgufValue::String("llama".into())),
+        ("tokenizer.ggml.model", GgufValue::String("gpt2".into())),
         ("tokenizer.ggml.tokens", GgufValue::Array(vec![])),
     ]))
     .unwrap_err();
@@ -396,7 +396,7 @@ fn empty_tokens_array_is_rejected() {
 #[test]
 fn duplicate_tokens_are_rejected() {
     let error = Tokenizer::from_gguf(&build_gguf_bare(&[
-        ("tokenizer.ggml.model", GgufValue::String("llama".into())),
+        ("tokenizer.ggml.model", GgufValue::String("gpt2".into())),
         (
             "tokenizer.ggml.tokens",
             GgufValue::Array(vec![
@@ -415,7 +415,7 @@ fn short_token_type_array_is_rejected() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -441,7 +441,7 @@ fn non_int32_token_type_is_rejected() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -477,7 +477,7 @@ fn merge_without_space_separator_is_rejected() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -503,7 +503,7 @@ fn merge_leading_space_is_accepted() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -536,7 +536,7 @@ fn merge_multibyte_first_char_is_accepted() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -576,7 +576,7 @@ fn duplicate_merges_keep_first_rank() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -622,7 +622,7 @@ fn out_of_range_bos_id_is_rejected() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -650,7 +650,7 @@ fn null_sentinel_special_ids_are_treated_as_unset() {
         let metadata: Vec<(String, GgufValue)> = vec![
             (
                 "tokenizer.ggml.model".into(),
-                GgufValue::String("llama".into()),
+                GgufValue::String("gpt2".into()),
             ),
             (
                 "tokenizer.ggml.tokens".into(),
@@ -669,7 +669,7 @@ fn other_negative_special_ids_are_rejected() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -693,7 +693,7 @@ fn special_ids_accept_multiple_integer_types() {
         let metadata: Vec<(String, GgufValue)> = vec![
             (
                 "tokenizer.ggml.model".into(),
-                GgufValue::String("llama".into()),
+                GgufValue::String("gpt2".into()),
             ),
             (
                 "tokenizer.ggml.tokens".into(),
@@ -715,7 +715,7 @@ fn missing_token_type_treats_everything_as_normal() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -770,7 +770,7 @@ fn unknown_symbol_maps_to_unk_id() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -813,7 +813,7 @@ fn unencodable_symbol_is_an_error() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -836,7 +836,7 @@ fn empty_special_token_does_not_hang_encoding() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -896,7 +896,7 @@ fn multibyte_characters_encode_per_char() {
     let metadata: Vec<(String, GgufValue)> = vec![
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),
@@ -932,6 +932,206 @@ fn round_trip_recovers_the_original_text() {
         )
         .unwrap();
     assert_eq!(tokenizer.decode(&ids).unwrap(), text);
+}
+
+// ---------------------------------------------------------------- SPM
+
+#[test]
+fn spm_round_trip_restores_space_marker_encoded_as_byte_tokens() {
+    for prefix in [false, true] {
+        let mut gguf = spm_gguf(prefix);
+        let Some(GgufValue::Array(tokens)) = gguf.metadata.get_mut("tokenizer.ggml.tokens") else {
+            panic!("missing test vocab")
+        };
+        tokens[3] = GgufValue::String("z".into());
+        let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
+        for text in ["文 文", "文</s> 文"] {
+            let ids = tokenizer.encode_with_options(text, &no_special()).unwrap();
+            assert_eq!(tokenizer.decode(&ids).unwrap(), text);
+        }
+    }
+}
+
+#[test]
+fn spm_rejects_malformed_whitespace_normalization_flag() {
+    for value in [GgufValue::String("true".into()), GgufValue::Uint32(1)] {
+        let mut gguf = spm_gguf(false);
+        gguf.metadata
+            .insert("tokenizer.ggml.remove_extra_whitespaces".into(), value);
+        let error = Tokenizer::from_gguf(&gguf).unwrap_err();
+        assert!(error.contains("remove_extra_whitespaces"), "{error}");
+    }
+}
+
+fn spm_gguf(prefix: bool) -> GgufFile {
+    let mut gguf = build_gguf(&[]);
+    let mut vocab: Vec<String> = [
+        "<s>", "</s>", "<unk>", "▁", "a", "b", "c", "ab", "bc", "▁a", "▁ab", "中", "文",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    vocab.extend((0..=255).map(|byte| format!("<0x{byte:02X}>")));
+    let mut types = vec![3, 3, 2];
+    types.extend(vec![1; 10]);
+    types.extend(vec![6; 256]);
+    let mut scores = vec![-1000.0; vocab.len()];
+    scores[7] = -1.0;
+    scores[8] = 1.0;
+    scores[9] = 0.0;
+    scores[10] = -2.0;
+    gguf.metadata.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("llama".into()),
+    );
+    gguf.metadata.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vocab.into_iter().map(GgufValue::String).collect()),
+    );
+    gguf.metadata.insert(
+        "tokenizer.ggml.token_type".into(),
+        GgufValue::Array(types.into_iter().map(GgufValue::Int32).collect()),
+    );
+    gguf.metadata.insert(
+        "tokenizer.ggml.scores".into(),
+        GgufValue::Array(scores.into_iter().map(GgufValue::Float32).collect()),
+    );
+    gguf.metadata.insert(
+        "tokenizer.ggml.add_space_prefix".into(),
+        GgufValue::Bool(prefix),
+    );
+    gguf.metadata.insert(
+        "tokenizer.ggml.unknown_token_id".into(),
+        GgufValue::Uint32(2),
+    );
+    gguf
+}
+
+fn no_special() -> EncodeOptions {
+    EncodeOptions {
+        add_bos: false,
+        add_eos: false,
+    }
+}
+
+#[test]
+fn spm_chooses_highest_score_instead_of_merge_rank() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    assert_eq!(
+        tokenizer.encode_with_options("abc", &no_special()).unwrap(),
+        [4, 8]
+    );
+}
+
+#[test]
+fn spm_equal_scores_choose_leftmost_pair() {
+    let mut gguf = spm_gguf(false);
+    if let GgufValue::Array(scores) = gguf.metadata.get_mut("tokenizer.ggml.scores").unwrap() {
+        scores[7] = GgufValue::Float32(1.0);
+    }
+    let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
+    assert_eq!(
+        tokenizer.encode_with_options("abc", &no_special()).unwrap(),
+        [7, 6]
+    );
+}
+
+#[test]
+fn spm_merges_space_marker_with_word() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(true)).unwrap();
+    assert_eq!(tokenizer.encode("ab").unwrap(), [0, 10]);
+}
+
+#[test]
+fn spm_keeps_distinct_repeated_occurrences() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    assert_eq!(
+        tokenizer
+            .encode_with_options("abab", &no_special())
+            .unwrap(),
+        [7, 7]
+    );
+}
+
+#[test]
+fn spm_falls_back_to_bytes_before_unknown() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    let expected: Vec<i32> = "🦊".bytes().map(|byte| 13 + i32::from(byte)).collect();
+    assert_eq!(
+        tokenizer.encode_with_options("🦊", &no_special()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn spm_decodes_utf8_byte_sequence_as_one_character() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    let ids: Vec<i32> = "🦊".bytes().map(|byte| 13 + i32::from(byte)).collect();
+    assert_eq!(tokenizer.decode(&ids).unwrap(), "🦊");
+}
+
+#[test]
+fn spm_invalid_utf8_uses_replacement_character() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    assert_eq!(tokenizer.decode(&[13 + 0xFF]).unwrap(), "\u{FFFD}");
+}
+
+#[test]
+fn spm_round_trip_preserves_chinese_emoji_and_whitespace() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(false)).unwrap();
+    let text = "  中文 a🦊b\n\t  ";
+    let ids = tokenizer.encode_with_options(text, &no_special()).unwrap();
+    assert_eq!(tokenizer.decode(&ids).unwrap(), text);
+}
+
+#[test]
+fn spm_decode_removes_only_synthetic_space_per_fragment() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(true)).unwrap();
+    let text = "  ab</s> 中文🦊  ";
+    let ids = tokenizer.encode_with_options(text, &no_special()).unwrap();
+    assert_eq!(tokenizer.decode(&ids).unwrap(), text);
+}
+
+#[test]
+fn spm_empty_prompt_still_adds_bos() {
+    let tokenizer = Tokenizer::from_gguf(&spm_gguf(true)).unwrap();
+    assert_eq!(tokenizer.encode("").unwrap(), [0]);
+    assert_eq!(
+        tokenizer.encode_with_options("", &no_special()).unwrap(),
+        []
+    );
+}
+
+#[test]
+fn spm_requires_scores_instead_of_silently_using_merges() {
+    let mut gguf = spm_gguf(false);
+    gguf.metadata.remove("tokenizer.ggml.scores");
+    assert!(Tokenizer::from_gguf(&gguf).unwrap_err().contains("scores"));
+}
+
+#[test]
+fn spm_rejects_short_or_nonfinite_scores() {
+    for bad in [
+        vec![GgufValue::Float32(0.0)],
+        vec![GgufValue::Float32(f32::NAN); 269],
+    ] {
+        let mut gguf = spm_gguf(false);
+        gguf.metadata
+            .insert("tokenizer.ggml.scores".into(), GgufValue::Array(bad));
+        assert!(Tokenizer::from_gguf(&gguf).unwrap_err().contains("scores"));
+    }
+}
+
+#[test]
+fn unknown_tokenizer_model_is_an_explicit_error() {
+    let mut gguf = spm_gguf(false);
+    gguf.metadata.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("unsupported".into()),
+    );
+    assert!(Tokenizer::from_gguf(&gguf)
+        .unwrap_err()
+        .contains("unsupported"));
 }
 
 // ---------------------------------------------------------------- 辅助构造
@@ -989,7 +1189,7 @@ fn build_gguf_without_bos() -> Tokenizer {
         ),
         (
             "tokenizer.ggml.model".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String("gpt2".into()),
         ),
         (
             "tokenizer.ggml.tokens".into(),

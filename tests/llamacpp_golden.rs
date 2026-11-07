@@ -373,21 +373,10 @@ fn golden_greedy_chain_matches_reference_for_sixteen_steps() {
 
 #[test]
 #[ignore = "需要 QLLAMA_REAL_MODEL 指向 golden 头部记录的那个模型"]
-fn tokenizer_divergence_from_llamacpp_is_limited_to_word_piece_granularity() {
-    // 与 llama.cpp b12109 `/tokenize`（add_special=true）的分词对照，阶段 7 任务 3.3。
-    //
-    // 实测结论（下方 cases 数组里的 id 就是 llama.cpp 的原始输出）：两侧 id 序列
-    // **不相同**，但差异全部来自一处已知设计选择——stories15M 的 SPM 词表只有
-    // `tokenizer.ggml.scores` 没有 `tokenizer.ggml.merges`，而阶段 4 的分词器按
-    // 既定范围只实现 BPE-with-merges，对无 merges 的文件退化为"逐字符 + byte
-    // fallback"（`src/tokenizer/tokenizer.rs` 头部已知限制第 1 条）。
-    //
-    // 因此这里不断言 id 相等（那属于阶段 8 的 scores 驱动 SPM 合并工作量），
-    // 而是把"差异无害"的三个可验证性质钉住，三条期望都独立于被测实现：
-    // 1. 两侧 id 用同一份词表解码得到完全相同的文本 → 没有丢信息；
-    // 2. 数字串 `1234567890` 的 id 与 llama.cpp 完全相同 → byte/单字符 token 的
-    //    词表索引正确，分歧只在多字符词片段；
-    // 3. 我们的序列更长 → 粒度更细，这是对上下文窗口的真实代价，必须可见。
+fn tokenizer_matches_llamacpp_ids_for_frozen_prompts() {
+    // 保留阶段 7 的三个固定 prompt 和全部既有性质断言；SPM 实现后进一步要求
+    // 与当时 b12109 原始输出逐 id 相同，不再只检查解码等价与长度下界。
+    // 期望 ids 不变，tests/golden 的冻结数据也不变。
     let Some((gguf, _ids, _rows)) = load_verified_model() else {
         eprintln!("跳过：未设置 QLLAMA_REAL_MODEL");
         return;
@@ -418,7 +407,12 @@ fn tokenizer_divergence_from_llamacpp_is_limited_to_word_piece_granularity() {
             .encode_with_options(prompt, &EncodeOptions::default())
             .expect("编码失败");
 
-        // 性质 1：文本级等价（BOS 与空格前缀两侧都要一致地体现）。
+        assert_eq!(
+            ours, llamacpp_ids,
+            "prompt {prompt:?}: SPM token ids must match llama.cpp"
+        );
+
+        // 保留原有文本级等价断言。
         assert_eq!(
             tokenizer.decode(&ours).expect("解码 ours 失败"),
             tokenizer
@@ -427,7 +421,7 @@ fn tokenizer_divergence_from_llamacpp_is_limited_to_word_piece_granularity() {
             "prompt {prompt:?}: 两侧 id 必须解码成同一文本"
         );
 
-        // 性质 3：差异方向固定为"我们更细"，并把两侧长度打印出来供文档引用。
+        // 原有长度下界仍须成立，新增的逐 id 相等断言进一步收紧该契约。
         assert!(
             ours.len() >= llamacpp_ids.len(),
             "prompt {prompt:?}: 预期我们的序列不短于 llama.cpp（ours {} vs cpp {}）",
