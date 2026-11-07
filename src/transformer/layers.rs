@@ -46,6 +46,7 @@
 //! 分母 `n_dims` 即被旋转的维度数：本项目的配置层拒绝 `rope.dimension_count !=
 //! head_dim` 的 partial RoPE（见 `transformer::config`），因此两者恒等。
 
+use crate::gguf::MappedWeight;
 use crate::kv_cache::KvCache;
 use crate::tensor::{Tensor, TensorOps};
 
@@ -177,6 +178,79 @@ impl Linear {
     }
 }
 
+// 既有 Tensor 层保留公开接口；映射权重通过枚举接入同一前向计算，不伪造 Tensor。
+#[derive(Debug)]
+pub(crate) enum Projection {
+    Dense(Linear),
+    Mapped(MappedWeight),
+}
+
+impl From<Linear> for Projection {
+    fn from(value: Linear) -> Self {
+        Self::Dense(value)
+    }
+}
+
+impl Projection {
+    pub(crate) fn mapped(weight: MappedWeight) -> Result<Self, String> {
+        if weight.dims().len() != 2 {
+            return Err(format!("Linear weight must be 2D, got {:?}", weight.dims()));
+        }
+        Ok(Self::Mapped(weight))
+    }
+
+    pub(crate) fn dims(&self) -> [usize; 2] {
+        match self {
+            Self::Dense(layer) => [layer.weight().dims()[0], layer.weight().dims()[1]],
+            Self::Mapped(weight) => [weight.dims()[1], weight.dims()[0]],
+        }
+    }
+
+    pub(crate) fn forward(&self, input: &Tensor) -> Result<Tensor, String> {
+        match self {
+            Self::Dense(layer) => layer.forward(input),
+            Self::Mapped(weight) => weight.matmul(input),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TokenEmbedding {
+    Dense(Embedding),
+    Mapped(MappedWeight),
+}
+
+impl TokenEmbedding {
+    pub(crate) fn dims(&self) -> &[usize] {
+        match self {
+            Self::Dense(layer) => layer.weight().dims(),
+            Self::Mapped(weight) => weight.dims(),
+        }
+    }
+
+    pub(crate) fn forward(&self, ids: &[i32]) -> Result<Tensor, String> {
+        match self {
+            Self::Dense(layer) => layer.forward(ids),
+            Self::Mapped(weight) => {
+                let width = weight.dims()[1];
+                let mut values = Vec::with_capacity(ids.len() * width);
+                for (position, &id) in ids.iter().enumerate() {
+                    let row = usize::try_from(id)
+                        .map_err(|_| format!("Token id {id} at position {position} is negative"))?;
+                    if row >= weight.dims()[0] {
+                        return Err(format!(
+                            "Token id {id} at position {position} exceeds vocabulary size {}",
+                            weight.dims()[0]
+                        ));
+                    }
+                    values.extend(weight.read_row(row)?);
+                }
+                Ok(Tensor::new(values, vec![ids.len(), width]))
+            }
+        }
+    }
+}
+
 /// RMSNorm 层。
 #[derive(Debug)]
 pub struct RmsNorm {
@@ -225,10 +299,10 @@ impl RmsNorm {
 /// 输入。两条路径都把它定义为"首 token 的绝对位置"。
 #[derive(Debug)]
 pub struct Attention {
-    wq: Linear,
-    wk: Linear,
-    wv: Linear,
-    wo: Linear,
+    wq: Projection,
+    wk: Projection,
+    wv: Projection,
+    wo: Projection,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -251,6 +325,20 @@ impl Attention {
         head_dim: usize,
         rope_theta: f32,
     ) -> Result<Self, String> {
+        Self::from_projections(
+            [wq.into(), wk.into(), wv.into(), wo.into()],
+            [num_heads, num_kv_heads, head_dim],
+            rope_theta,
+        )
+    }
+
+    pub(crate) fn from_projections(
+        projections: [Projection; 4],
+        heads: [usize; 3],
+        rope_theta: f32,
+    ) -> Result<Self, String> {
+        let [wq, wk, wv, wo] = projections;
+        let [num_heads, num_kv_heads, head_dim] = heads;
         if num_heads == 0 || num_kv_heads == 0 || head_dim == 0 {
             return Err("Attention head counts and head_dim must be positive".to_string());
         }
@@ -259,8 +347,8 @@ impl Attention {
                 "num_heads {num_heads} must be divisible by num_kv_heads {num_kv_heads}"
             ));
         }
-        let q_features = wq.weight().dims()[1];
-        let kv_features = wk.weight().dims()[1];
+        let q_features = wq.dims()[1];
+        let kv_features = wk.dims()[1];
         if q_features != num_heads * head_dim {
             return Err(format!(
                 "Q projection outputs {q_features} features but num_heads*head_dim is {}",
@@ -536,9 +624,9 @@ fn apply_causal_mask_offset(scores: &Tensor, query_offset: usize) -> Result<Tens
 /// `LLM_FFN_SILU` + `LLM_FFN_PAR` 组合一致。
 #[derive(Debug)]
 pub struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: Projection,
+    up_proj: Projection,
+    down_proj: Projection,
 }
 
 impl Mlp {
@@ -547,19 +635,27 @@ impl Mlp {
     /// `gate_proj` 与 `up_proj` 的形状须一致，且 `down_proj` 的输入特征数
     /// 须等于二者的输出特征数。
     pub fn new(gate_proj: Linear, up_proj: Linear, down_proj: Linear) -> Result<Self, String> {
-        let gate_shape = gate_proj.weight().dims().to_vec();
-        if gate_shape != up_proj.weight().dims().to_vec() {
+        Self::from_projections(gate_proj.into(), up_proj.into(), down_proj.into())
+    }
+
+    pub(crate) fn from_projections(
+        gate_proj: Projection,
+        up_proj: Projection,
+        down_proj: Projection,
+    ) -> Result<Self, String> {
+        let gate_shape = gate_proj.dims();
+        if gate_shape != up_proj.dims() {
             return Err(format!(
                 "gate_proj {:?} and up_proj {:?} must have the same shape",
                 gate_shape,
-                up_proj.weight().dims()
+                up_proj.dims()
             ));
         }
         let intermediate = gate_shape[1];
-        if down_proj.weight().dims()[0] != intermediate {
+        if down_proj.dims()[0] != intermediate {
             return Err(format!(
                 "down_proj expects {} input features but the intermediate size is {intermediate}",
-                down_proj.weight().dims()[0]
+                down_proj.dims()[0]
             ));
         }
         Ok(Self {

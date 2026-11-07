@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::Mmap;
 
@@ -32,16 +33,16 @@ pub struct GgufFile {
     ///
     /// `Mmap` 独立于创建它的 `File`，句柄自身保活映射，因此无需在此额外持有文件。
     /// 对 loader 模块可见，便于在同一父模块内拆分实现。
-    pub(super) tensor_data: Option<Mmap>,
+    pub(super) tensor_data: Option<Arc<Mmap>>,
 }
 
 impl GgufFile {
-    /// Parse a GGUF file from path
+    /// 解析并只读映射 GGUF 文件；映射及其权重存活期间不得修改或截断原文件。
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut file = File::open(path)?;
-        // 索引解析只用前几十字节，但权重加载需要整个数据段可寻址，因此映射整份文件。
-        // memmap2 在 Windows 上没有安全的 map 入口，此处 unsafe 的必要性与约束见 loader.rs。
-        let tensor_data = Some(unsafe { Mmap::map(&file)? });
+        // 复用既有 mmap 入口。调用方须保持原文件不变；Arc 让权重共享并保活映射，
+        // 不复制文件内容，也不为每个权重建立新映射。
+        let tensor_data = Some(Arc::new(unsafe { Mmap::map(&file)? }));
         Self::from_reader(&mut file).map(|parsed| Self {
             tensor_data,
             ..parsed

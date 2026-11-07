@@ -287,14 +287,16 @@ fn from_gguf_falls_back_to_tied_embeddings() {
 
 #[test]
 fn from_gguf_rejects_quantized_weights() {
-    // 量化张量在索引里就存在，加载阶段必须给出"暂不支持"而不是解出垃圾数值。
+    // 量化张量在索引里就存在；本用例的字节数不是合法 Q4_0 块布局，加载必须
+    // 给出类型错误而不是解出垃圾数值。真实的 Q4_0/Q8_0 解码由 tests/gguf_loader.rs
+    // 的 mapped_* 用例与真实模型验收覆盖。
     let model = model_with(|builder| {
         builder.quantize("blk.0.attn_q.weight");
     });
     let error = Transformer::from_gguf(&model).expect_err("量化权重应报错");
     assert!(
-        error.contains("Quantized"),
-        "错误信息应指出量化类型不受支持，实得: {error}"
+        error.contains("blk.0.attn_q.weight") && error.contains("Q4_0"),
+        "错误信息应指出量化张量与类型，实得: {error}"
     );
 }
 

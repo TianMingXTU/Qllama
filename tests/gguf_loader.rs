@@ -147,6 +147,155 @@ fn write_gguf(name: &str, tensors: &[TensorSpec], alignment: u64) -> PathBuf {
 }
 
 #[test]
+fn mapped_q4_rows_use_separate_low_and_high_nibble_planes() {
+    let mut bytes = vec![0x00, 0x3c];
+    bytes.extend((0u8..16).map(|i| i | ((15 - i) << 4)));
+    let path = write_gguf(
+        "mapped-q4-planes",
+        &[TensorSpec::raw("w", vec![32, 1], 2, bytes)],
+        32,
+    );
+    let gguf = GgufFile::from_path(&path).unwrap();
+    let weight = gguf.load_weight("w").unwrap();
+    let expected: Vec<f32> = (-8..8).chain((-8..8).rev()).map(|n| n as f32).collect();
+    assert_eq!(weight.read_row(0).unwrap(), expected);
+    assert_eq!(weight.storage_bytes(), 18);
+    assert_eq!(weight.dims(), &[1, 32]);
+}
+
+#[test]
+fn mapped_q8_preserves_signed_bytes_and_half_scale() {
+    let mut bytes = vec![0x00, 0x38]; // 0.5
+    let values: Vec<i8> = (0..32)
+        .map(|i| {
+            if i == 0 {
+                -128
+            } else if i == 31 {
+                127
+            } else {
+                i - 16
+            }
+        })
+        .collect();
+    bytes.extend(values.iter().map(|&v| v as u8));
+    let path = write_gguf(
+        "mapped-q8-signed",
+        &[TensorSpec::raw("w", vec![32, 1], 8, bytes)],
+        32,
+    );
+    let weight = GgufFile::from_path(&path)
+        .unwrap()
+        .load_weight("w")
+        .unwrap();
+    assert_eq!(
+        weight.read_row(0).unwrap(),
+        values
+            .iter()
+            .map(|&v| f32::from(v) * 0.5)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(weight.storage_bytes(), 34);
+}
+
+#[test]
+fn mapped_quantized_matmul_handles_multiple_rows_without_transposing_storage() {
+    let mut bytes = vec![0x00, 0x3c];
+    bytes.extend([0xf0; 16]); // -8 前半，+7 后半。
+    bytes.extend([0x00, 0x40]);
+    bytes.extend([0x87; 16]); // scale=2，前半 -2，后半 0。
+    let path = write_gguf(
+        "mapped-q4-matmul",
+        &[TensorSpec::raw("w", vec![32, 2], 2, bytes)],
+        32,
+    );
+    let weight = GgufFile::from_path(&path)
+        .unwrap()
+        .load_weight("w")
+        .unwrap();
+    let input: Vec<f32> = [vec![1.0; 32], vec![2.0; 16], vec![-1.0; 16]].concat();
+    let output = weight
+        .matmul(&qllama::tensor::Tensor::new(input, vec![2, 32]))
+        .unwrap();
+    assert_eq!(output.dims(), &[2, 2]);
+    assert_eq!(output.data(), &[-16.0, -32.0, -368.0, -64.0]);
+}
+
+#[test]
+fn mapped_quantized_zero_and_negative_scales_are_respected() {
+    for (name, scale, expected) in [("zero", 0x0000u16, 0.0), ("negative", 0xbc00u16, 8.0)] {
+        let mut bytes = scale.to_le_bytes().to_vec();
+        bytes.extend([0x00; 16]);
+        let path = write_gguf(name, &[TensorSpec::raw("w", vec![32, 1], 2, bytes)], 32);
+        let weight = GgufFile::from_path(&path)
+            .unwrap()
+            .load_weight("w")
+            .unwrap();
+        assert_eq!(weight.read_row(0).unwrap(), vec![expected; 32]);
+    }
+}
+
+#[test]
+fn mapped_weights_keep_the_mapping_alive_and_f16_stays_compressed() {
+    let path = write_gguf(
+        "mapped-lifetime",
+        &[TensorSpec::f16(
+            "w",
+            vec![2, 2],
+            &[0x3c00, 0xc000, 0x3800, 0x4000],
+        )],
+        32,
+    );
+    let gguf = GgufFile::from_path(&path).unwrap();
+    let weight = gguf.load_weight("w").unwrap();
+    drop(gguf);
+    assert_eq!(weight.storage_bytes(), 8);
+    assert_eq!(weight.read_row(1).unwrap(), vec![0.5, 2.0]);
+    let input = qllama::tensor::Tensor::new(vec![2.0, -1.0], vec![1, 2]);
+    assert_eq!(weight.matmul(&input).unwrap().data(), &[4.0, -1.0]);
+    assert!(weight.read_row(2).is_err());
+    assert!(weight
+        .matmul(&qllama::tensor::Tensor::new(vec![1.0], vec![1, 1]))
+        .is_err());
+}
+
+#[test]
+fn mapped_weights_reject_truncated_blocks_and_unaligned_rows() {
+    for (name, dims, bytes) in [
+        ("truncated", vec![32, 1], vec![0u8; 17]),
+        ("unaligned", vec![31, 1], vec![0u8; 18]),
+    ] {
+        let path = write_gguf(name, &[TensorSpec::raw("w", dims, 2, bytes)], 32);
+        assert!(GgufFile::from_path(&path)
+            .unwrap()
+            .load_weight("w")
+            .is_err());
+    }
+}
+
+#[test]
+fn mapped_weights_reject_unsupported_types_and_shape_overflow() {
+    let path = write_gguf(
+        "mapped-unsupported",
+        &[TensorSpec::raw("w", vec![256, 1], 14, vec![0u8; 210])],
+        32,
+    );
+    let error = GgufFile::from_path(&path)
+        .unwrap()
+        .load_weight("w")
+        .unwrap_err();
+    assert!(error.contains("Q6_K"), "{error}");
+    let path = write_gguf(
+        "mapped-overflow",
+        &[TensorSpec::raw("w", vec![u64::MAX, 2], 0, vec![])],
+        32,
+    );
+    assert!(GgufFile::from_path(&path)
+        .unwrap()
+        .load_weight("w")
+        .is_err());
+}
+
+#[test]
 fn loads_f32_tensor_values() {
     let path = write_gguf(
         "f32-values",

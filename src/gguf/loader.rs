@@ -15,7 +15,7 @@
 //! 反转为 `[n_vocab, n_embd]` 后，按 token id 取行才能命中正确区间。
 //!
 //! 反转之后，权重在内存中的逻辑矩阵就是 `[out_features, in_features]`，
-//! 所以 `transformer::layers::Linear` 内部按该方向存储，前向时再转置。
+//! Tensor 路径的 Linear 在构造时转置一次；映射权重保持原布局直接计算。
 
 use super::types::{GgmlType, TensorInfo};
 use crate::tensor::Tensor;
@@ -26,6 +26,32 @@ const F16_EXPONENT_MASK: u16 = 0x1F;
 const F16_MANTISSA_MASK: u16 = 0x03FF;
 
 impl super::GgufFile {
+    /// 加载共享映射的 F32/F16/Q4_0/Q8_0 权重，保持原始存储精度。
+    ///
+    /// 构造时检查维度乘积、块宽、偏移与映射边界；不支持的类型明确报错。
+    pub fn load_weight(&self, name: &str) -> Result<super::MappedWeight, String> {
+        let info = self.tensor_info(name)?;
+        let mapping = self.tensor_data.as_ref().ok_or_else(|| {
+            format!("Tensor data for {name} is unavailable: use GgufFile::from_path")
+        })?;
+        let dims = info
+            .dims
+            .iter()
+            .rev()
+            .map(|&dim| {
+                usize::try_from(dim)
+                    .map_err(|_| format!("Tensor {name} dimension {dim} exceeds usize"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let start = self
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| format!("Tensor {name} offset overflows address range"))?;
+        super::MappedWeight::new(mapping.clone(), start, dims, info.ggml_type)
+            .map_err(|error| format!("Tensor {name}: {error}"))
+    }
+
     /// 按名称加载一个 F32 张量。
     ///
     /// 名称不存在、类型不是 F32 或数据段越界时返回错误。
@@ -164,7 +190,7 @@ impl super::GgufFile {
 }
 
 /// 计算维度乘积，乘积溢出 usize 时返回错误。
-fn checked_product(dims: &[usize]) -> Result<usize, String> {
+pub(super) fn checked_product(dims: &[usize]) -> Result<usize, String> {
     dims.iter().try_fold(1usize, |product, &dim| {
         product
             .checked_mul(dim)
@@ -179,7 +205,7 @@ fn checked_product(dims: &[usize]) -> Result<usize, String> {
 ///
 /// 每个分支在 f32 中都精确可表示：规格化数的尾数只需 11 位，次正规数是 2^-24
 /// 的整数倍，指数缩放不改变有效位，因此不存在额外舍入。
-fn f16_to_f32(bits: u16) -> f32 {
+pub(super) fn f16_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exponent = (bits >> 10) & F16_EXPONENT_MASK;
     let mantissa = bits & F16_MANTISSA_MASK;
