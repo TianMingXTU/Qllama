@@ -18,7 +18,6 @@ use crate::tensor::Tensor;
 ///   两条路径的最后位置 logits 由测试锁定为逐值一致。
 #[derive(Debug)]
 pub struct Transformer {
-    /// Model configuration
     config: TransformerConfig,
     /// 词嵌入，`[vocab_size, hidden_size]`
     embed_tokens: TokenEmbedding,
@@ -141,7 +140,6 @@ impl Transformer {
         let lm_head = weights.linear(config.vocab_size, hidden_size)?;
         Self::from_parts(config, embed_tokens, layers, norm, lm_head)
     }
-    /// Get model configuration
     pub fn config(&self) -> &TransformerConfig {
         &self.config
     }
@@ -151,7 +149,7 @@ impl Transformer {
     /// 张量名按 llama.cpp `llama-arch.cpp` 的 `LLM_TENSOR` 映射表拼装：
     /// `token_embd`、`blk.{i}.attn_{q,k,v,output}`、`blk.{i}.ffn_{gate,up,down}`、
     /// `blk.{i}.attn_norm`、`blk.{i}.ffn_norm`、`output_norm`、`output`。
-    /// 维度反转约定见 [`crate::gguf`] 的模块文档。
+    /// 维度反转约定见 `gguf::loader` 的模块头注释。
     ///
     /// 缺 `output.weight` 时回退为与词嵌入共享权重（tied embeddings），
     /// llama.cpp 的 `llm_load_tensors` 对同一情形也这样做。代价是模型内多存

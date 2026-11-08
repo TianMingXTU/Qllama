@@ -1,96 +1,77 @@
-//! Tensor data structure
+//! 行主序连续存储的 f32 多维数组。
 
-use super::DType;
 use std::sync::Arc;
 
-/// A multi-dimensional array
+/// 多维 f32 数组。
+///
+/// `data` 经 `Arc` 共享，`view`/`reshape` 只复制元数据不复制缓冲；写操作
+/// （`set`）经 `Arc::make_mut` 触发写时复制，不影响其他视图。`new` 不校验
+/// 维度乘积与缓冲长度是否一致，重排类运算在用坐标换算前会拦下这种畸形输入。
 #[derive(Debug, Clone)]
 pub struct Tensor {
-    /// Data buffer (shared via Arc for zero-copy)
     data: Arc<Vec<f32>>,
-    /// Dimensions
     dims: Vec<usize>,
-    /// Strides for each dimension
     strides: Vec<usize>,
-    /// Data type
-    dtype: DType,
 }
 
 impl Tensor {
-    /// Create a new tensor from data and dimensions
+    /// 从扁平缓冲与维度构造张量，按行主序计算 strides。
     pub fn new(data: Vec<f32>, dims: Vec<usize>) -> Self {
         let strides = compute_strides(&dims);
         Self {
             data: Arc::new(data),
             dims,
             strides,
-            dtype: DType::F32,
         }
     }
 
-    /// Create a tensor filled with zeros
     pub fn zeros(dims: Vec<usize>) -> Self {
         let total_size: usize = dims.iter().product();
         let data = vec![0.0; total_size];
         Self::new(data, dims)
     }
 
-    /// Create a tensor filled with ones
     pub fn ones(dims: Vec<usize>) -> Self {
         let total_size: usize = dims.iter().product();
         let data = vec![1.0; total_size];
         Self::new(data, dims)
     }
 
-    /// Get tensor dimensions
     pub fn dims(&self) -> &[usize] {
         &self.dims
     }
 
-    /// Get tensor strides
     pub fn strides(&self) -> &[usize] {
         &self.strides
     }
 
-    /// Get number of dimensions
     pub fn ndim(&self) -> usize {
         self.dims.len()
     }
 
-    /// Get total number of elements
+    /// 缓冲中的元素总数；与维度乘积可能不一致（见类型文档），运算入口各自校验。
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    /// Check if tensor is empty
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    /// Get data type
-    pub fn dtype(&self) -> DType {
-        self.dtype
-    }
-
-    /// Get raw data as slice
     pub fn data(&self) -> &[f32] {
         &self.data
     }
 
-    /// Get element at flattened index
-    pub fn get_flat(&self, index: usize) -> Option<f32> {
-        self.data.get(index).copied()
-    }
-
-    /// Set element at flattened index
-    pub fn set_flat(&mut self, index: usize, value: f32) {
-        if index < self.data.len() {
-            let data = Arc::make_mut(&mut self.data);
-            data[index] = value;
+    /// 共享同一缓冲的等价张量（复制元数据，不复制数据）。
+    pub fn view(&self) -> Self {
+        Self {
+            data: Arc::clone(&self.data),
+            dims: self.dims.clone(),
+            strides: self.strides.clone(),
         }
     }
 
-    /// Reshape tensor (total size must match)
+    /// 改变形状并共享同一缓冲；元素总数必须一致，数据不重排。
     pub fn reshape(&self, new_dims: Vec<usize>) -> Result<Self, String> {
         let new_size: usize = new_dims.iter().product();
         if new_size != self.len() {
@@ -106,18 +87,7 @@ impl Tensor {
             data: Arc::clone(&self.data),
             dims: new_dims,
             strides,
-            dtype: self.dtype,
         })
-    }
-
-    /// Create a view of the tensor (shares data)
-    pub fn view(&self) -> Self {
-        Self {
-            data: Arc::clone(&self.data),
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
-            dtype: self.dtype,
-        }
     }
 
     /// 按多维坐标读取元素，如 `get(&[1, 2, 0])`。

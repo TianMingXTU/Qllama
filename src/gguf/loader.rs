@@ -231,12 +231,6 @@ pub(super) fn f16_to_f32(bits: u16) -> f32 {
     sign * magnitude
 }
 
-/// 供测试直接验证转换函数，避免每个用例都构造一个 GGUF 文件。
-#[cfg(test)]
-pub(super) fn f16_to_f32_for_test(bits: u16) -> f32 {
-    f16_to_f32(bits)
-}
-
 /// 加载器的单元测试只覆盖纯函数；涉及文件与映射的用例见 `tests/gguf_loader.rs`。
 #[cfg(test)]
 mod tests {
@@ -245,28 +239,28 @@ mod tests {
     #[test]
     fn f16_conversion_matches_hand_computed_values() {
         // 规格化数。
-        assert_eq!(f16_to_f32_for_test(0x3C00), 1.0);
-        assert_eq!(f16_to_f32_for_test(0xBC00), -1.0);
-        assert_eq!(f16_to_f32_for_test(0x4000), 2.0);
-        assert_eq!(f16_to_f32_for_test(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xBC00), -1.0);
+        assert_eq!(f16_to_f32(0x4000), 2.0);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
         // (1 + 341/1024) × 2^(13-15) = 1365/4096
-        assert_eq!(f16_to_f32_for_test(0x3555), 1365.0 / 4096.0);
+        assert_eq!(f16_to_f32(0x3555), 1365.0 / 4096.0);
         // 最大规格化数：(1 + 1023/1024) × 2^15 = 2047 × 32
-        assert_eq!(f16_to_f32_for_test(0x7BFF), 65504.0);
+        assert_eq!(f16_to_f32(0x7BFF), 65504.0);
         // 最小规格化数：2^-14
-        assert_eq!(f16_to_f32_for_test(0x0400), 2f32.powi(-14));
+        assert_eq!(f16_to_f32(0x0400), 2f32.powi(-14));
         // 次正规数：m × 2^-24
-        assert_eq!(f16_to_f32_for_test(0x0001), 2f32.powi(-24));
-        assert_eq!(f16_to_f32_for_test(0x03FF), 1023.0 * 2f32.powi(-24));
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+        assert_eq!(f16_to_f32(0x03FF), 1023.0 * 2f32.powi(-24));
         // 零与无穷。
-        assert_eq!(f16_to_f32_for_test(0x0000), 0.0);
-        assert!(f16_to_f32_for_test(0x8000).is_sign_negative());
-        assert_eq!(f16_to_f32_for_test(0x8000), 0.0);
-        assert_eq!(f16_to_f32_for_test(0x7C00), f32::INFINITY);
-        assert_eq!(f16_to_f32_for_test(0xFC00), f32::NEG_INFINITY);
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert!(f16_to_f32(0x8000).is_sign_negative());
+        assert_eq!(f16_to_f32(0x8000), 0.0);
+        assert_eq!(f16_to_f32(0x7C00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xFC00), f32::NEG_INFINITY);
         // NaN 保持为 NaN，不静默变成数值。
-        assert!(f16_to_f32_for_test(0x7E00).is_nan());
-        assert!(f16_to_f32_for_test(0xFFFF).is_nan());
+        assert!(f16_to_f32(0x7E00).is_nan());
+        assert!(f16_to_f32(0xFFFF).is_nan());
     }
 
     #[test]
@@ -274,7 +268,7 @@ mod tests {
         // 穷举全部 65536 个位模式，逐一对照独立参考实现。
         for bits in 0..=u16::MAX {
             let expected = reference_f16_to_f32(bits);
-            let actual = f16_to_f32_for_test(bits);
+            let actual = f16_to_f32(bits);
             if expected.is_nan() {
                 assert!(actual.is_nan(), "0x{bits:04X} 应为 NaN，得到 {actual}");
             } else {

@@ -1,21 +1,19 @@
-//! GGUF data types and structures
+//! GGUF 磁盘格式的值类型与结构体定义。
 
 use std::collections::HashMap;
 
-/// GGUF file header
+/// 24 字节文件头。
 #[derive(Debug, Clone)]
 pub struct GgufHeader {
-    /// Magic number, should be "GGUF"
+    /// 必须是 b"GGUF"，在 `from_reader` 里校验。
     pub magic: [u8; 4],
-    /// GGUF version
     pub version: u32,
-    /// Number of tensors
     pub tensor_count: u64,
-    /// Number of metadata key-value pairs
     pub metadata_kv_count: u64,
 }
 
-/// GGUF metadata value
+/// metadata 值的闭集；变体对应 GGUF 规范的标量类型与数组，数组元素类型
+/// 由 `parser` 另行校验（不支持嵌套数组）。
 #[derive(Debug, Clone)]
 pub enum GgufValue {
     Uint8(u8),
@@ -33,32 +31,26 @@ pub enum GgufValue {
     Float64(f64),
 }
 
-/// Tensor information
+/// 张量索引项；`dims` 保持 ggml 的 `ne[]` 顺序（`ne[0]` 最快变化），
+/// 使用方须按 `loader` 的约定反转。
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
-    /// Tensor name
     pub name: String,
-    /// Number of dimensions
+    /// 有效维度个数；ggml 上限 4，解析器超出即拒绝。
     pub n_dims: u32,
-    /// Dimensions
     pub dims: Vec<u64>,
-    /// GGML tensor type
     pub ggml_type: GgmlType,
-    /// Offset relative to tensor data start
+    /// 相对 `tensor_data_offset` 的字节偏移。
     pub offset: u64,
 }
 
-/// GGML tensor data type
+/// GGML 张量存储类型；变体与上游 `ggml.h` 的类型编号表对齐。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlType {
     F32,
     F16,
     Q4_0,
     Q4_1,
-    /// 仅为公开 API 兼容保留；上游已移除该类型，解析器拒绝其文件编号 4。
-    Q4_2,
-    /// 仅为公开 API 兼容保留；上游已移除该类型，解析器拒绝其文件编号 5。
-    Q4_3,
     Q5_0,
     Q5_1,
     Q8_0,
@@ -86,7 +78,7 @@ pub enum GgmlType {
 impl GgmlType {
     /// 返回标量类型的单元素字节数。
     ///
-    /// 块量化类型和已移除的 Q4_2/Q4_3 返回 0 哨兵值，不能据此计算张量字节数；
+    /// 块量化类型返回 0 哨兵值，不能据此计算张量字节数；
     /// 量化存储大小还需要块内元素数量、缩放因子等布局信息。
     pub fn element_size(&self) -> usize {
         match self {
@@ -109,11 +101,10 @@ impl GgmlType {
             GgmlType::I32 => 4,
             GgmlType::I64 => 8,
             GgmlType::F64 => 8,
-            GgmlType::Q4_2 | GgmlType::Q4_3 => 0,
         }
     }
 
-    /// 判断是否为当前支持的块量化类型；已移除的 Q4_2/Q4_3 返回 false。
+    /// 判断是否为块量化类型。
     pub fn is_quantized(&self) -> bool {
         matches!(
             self,

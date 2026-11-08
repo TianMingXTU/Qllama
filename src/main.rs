@@ -94,9 +94,6 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Initialize logger
-    env_logger::init();
-
     let args = Args::parse();
 
     // --threads 只影响 matmul 的并行划分，不改累加顺序；显式局部池与
@@ -140,11 +137,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
         println!("Loading model: {model_path:?}");
     }
 
-    // Parse GGUF file
     let gguf = qllama::gguf::GgufFile::from_path(model_path)
         .map_err(|error| anyhow::anyhow!("Cannot read model {}: {error}", model_path.display()))?;
 
-    // Print model information
     if verbose {
         print_model_info(&gguf);
     }

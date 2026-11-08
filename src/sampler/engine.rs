@@ -142,12 +142,10 @@ impl Sampler {
             return to_token_id(index);
         }
 
-        // ⚠️ 链序偏差（对照 llama.h L1351-1357 的官方示例链）：llama.cpp 是
-        // top_k → top_p → temp → dist，top-p 在未缩放分布上计算累计阈值；
-        // 本实现按任务书（与 HF transformers 相同的顺序）先做温度缩放再做
-        // top-k/top-p。top-k 不受影响（除正常数保序），但 top-p 的切点会随
-        // 温度变化：温度偏离 1 越远，同一 top_p 值保留的候选集与 llama.cpp
-        // 差别越大。两个候选结果各有使用者，阶段内按任务书执行。
+        // 链序与 llama.cpp 有意不同（llama.h L1351-1357 的示例链是
+        // top_k → top_p → temp → dist）：本实现按任务书采用与 HF transformers
+        // 相同的顺序，先温度缩放再 top-k/top-p。top-k 不受影响（除正常数保序），
+        // top-p 的切点会随温度偏移——这是已知差异，不是缺陷。
         for value in &mut working {
             *value /= self.config.temperature;
         }
@@ -183,11 +181,10 @@ fn to_token_id(index: usize) -> Result<i32, String> {
 /// 本实现不对 BOS/EOS/Control token 豁免，与 llama.cpp 的 penalties sampler
 /// 一致：后者同样只按 token id 计数，不区分 token 类别。
 ///
-/// ⚠️ 窗口差异：llama.cpp 用 ring buffer 只惩罚最近 `penalty_last_n`
-/// （默认 64）个 token（accept 时淘汰最老条目）；本实现按任务书惩罚传入
-/// 的完整 context（含全部 prompt）。长 prompt 下惩罚覆盖面比 llama.cpp
-/// 宽；接 KV Cache 重构采样状态时如需对齐，给 SamplerConfig 加 last_n
-/// 参数并在调用方截断 context 即可。
+/// 窗口差异：llama.cpp 用 ring buffer 只惩罚最近 `penalty_last_n`（默认 64）
+/// 个 token；本实现惩罚传入的完整 context（含全部 prompt），长 prompt 下
+/// 覆盖面比 llama.cpp 宽。如需对齐，给 SamplerConfig 加 last_n 参数并在
+/// 调用方截断 context 即可。
 fn apply_repeat_penalty(logits: &mut [f32], context: &[i32], penalty: f32) {
     if penalty == 1.0 {
         return;

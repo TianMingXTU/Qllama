@@ -1,16 +1,7 @@
-//! Tensor operations and data structures
+//! f32 张量与其逐算子实现：`data` 存数据与形状，`ops` 提供运算。
 
+mod data;
 mod ops;
-mod tensor;
 
+pub use data::Tensor;
 pub use ops::TensorOps;
-pub use tensor::Tensor;
-
-/// Data type for tensor elements
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DType {
-    F32,
-    F16,
-    I32,
-    I64,
-}

@@ -1,7 +1,4 @@
-//! GGUF format parser
-//!
-//! This module provides functionality to parse GGUF files and extract
-//! model metadata and tensor information.
+//! GGUF v3：索引解析、权重加载与映射存储。
 
 mod loader;
 mod parser;

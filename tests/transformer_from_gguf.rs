@@ -66,9 +66,7 @@ fn from_gguf_requires_rms_norm_epsilon() {
     let model = model_with(|builder| {
         builder.without_metadata("llama.attention.layer_norm_rms_epsilon");
     });
-    let error = Transformer::from_gguf(&model)
-        .err()
-        .expect("缺少 RMSNorm epsilon 时应拒绝加载");
+    let error = Transformer::from_gguf(&model).expect_err("缺少 RMSNorm epsilon 时应拒绝加载");
     assert!(
         error.contains("llama.attention.layer_norm_rms_epsilon"),
         "错误信息应指出缺失的 epsilon 键，实得: {error}"
@@ -119,9 +117,8 @@ fn from_gguf_rejects_invalid_rms_norm_epsilon() {
         });
         let config_error =
             TransformerConfig::from_gguf(&model).expect_err("非法 RMSNorm epsilon 时应报错");
-        let model_error = Transformer::from_gguf(&model)
-            .err()
-            .expect("非法 RMSNorm epsilon 时应拒绝加载");
+        let model_error =
+            Transformer::from_gguf(&model).expect_err("非法 RMSNorm epsilon 时应拒绝加载");
         for error in [config_error, model_error] {
             assert!(
                 error.contains("llama.attention.layer_norm_rms_epsilon"),

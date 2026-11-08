@@ -1,6 +1,6 @@
-//! Sampler for token generation
+//! 采样器：把 logits 行转成下一个 token id。
 
-mod sampler;
+mod engine;
 
-pub use sampler::Sampler;
-pub use sampler::SamplerConfig;
+pub use engine::Sampler;
+pub use engine::SamplerConfig;

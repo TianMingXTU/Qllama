@@ -67,9 +67,8 @@ pub struct Tokenizer {
     model: TokenizerModel,
     token_to_id: HashMap<String, i32>,
     id_to_token: Vec<String>,
-    /// 原始 merges 表（调试与展示用）；合并优先级看 [`Self::merge_ranks`]。
-    #[allow(dead_code)]
-    merges: Vec<(String, String)>,
+    /// merge 对到文件中的序号；序号小者优先合并，重复对保留首次出现的 rank
+    /// （上游 bpe_ranks.emplace 的语义，HashMap::insert 的 last-wins 会反过来）。
     merge_ranks: HashMap<(String, String), usize>,
     token_types: Vec<TokenType>,
     bos_id: Option<i32>,
@@ -79,29 +78,7 @@ pub struct Tokenizer {
     add_space_prefix: bool,
 }
 
-impl Default for Tokenizer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Tokenizer {
-    /// 空分词器：没有词表，encode/decode 自然报错。
-    pub fn new() -> Self {
-        Self {
-            model: TokenizerModel::MergeBpe,
-            token_to_id: HashMap::new(),
-            id_to_token: Vec::new(),
-            merges: Vec::new(),
-            merge_ranks: HashMap::new(),
-            token_types: Vec::new(),
-            bos_id: None,
-            eos_id: None,
-            unk_id: None,
-            add_space_prefix: true,
-        }
-    }
-
     /// 从 GGUF 元数据构造分词器。
     ///
     /// 键名与上游 llama.cpp `src/llama-arch.cpp` 的 LLM_KV_NAMES 表一致。
@@ -189,10 +166,7 @@ impl Tokenizer {
             }
         };
 
-        // merges 可选（真实 SPM 文件没有它）。每项 "A B" 按上游
-        // strchr(word + 1, ' ') 的语义切分：从第二个字符起找第一个空格，
-        // 因此首字符允许是空格。
-        let mut merges = Vec::new();
+        // merges 可选（真实 SPM 文件没有它）。
         let mut merge_ranks = HashMap::new();
         match metadata.get("tokenizer.ggml.merges") {
             None => {}
@@ -206,13 +180,11 @@ impl Tokenizer {
                             ))
                         }
                     };
-                    // 从第二个字节起找空格，对应上游 strchr(word + 1, ' ')
-                    // 的语义：首字符允许是空格。必须按字节扫描（上游就是
-                    // 纯字节搜索）而不是 word[1..] 切片——后者要求字节 1
-                    // 恰好是字符边界，首字符是多字节 UTF-8（如 GPT-2 merges
-                    // 首行的 "Ġ t"、SPM 的 "▁a b"）时直接 panic。UTF-8 的
-                    // 续字节与首字节都不会是 0x20，因此命中的空格必在字符
-                    // 边界上，两侧切片安全。
+                    // 分隔符搜索从第二个字节开始，对应上游 strchr(word + 1, ' ')
+                    // ——首字符允许是空格。这里按字节扫描而不是 word[1..] 切片：
+                    // 切片要求字节 1 恰好在字符边界上，首字符是多字节 UTF-8
+                    // （GPT-2 merges 的 "Ġ t"、SPM 的 "▁a b"）时直接 panic。
+                    // UTF-8 的续字节不会是 0x20，命中的空格必在字符边界，切片安全。
                     let split = if word.is_empty() {
                         None
                     } else {
@@ -227,11 +199,7 @@ impl Tokenizer {
                         ));
                     };
                     let pair = (word[..split].to_string(), word[split + 1..].to_string());
-                    // 上游 bpe_ranks.emplace 对重复对保留首次出现的 rank
-                    // （llama-vocab.cpp L2330）；HashMap::insert 是 last-wins，
-                    // 会让同一文件的合并优先级与上游相反。
-                    merge_ranks.entry(pair.clone()).or_insert(index);
-                    merges.push(pair);
+                    merge_ranks.entry(pair).or_insert(index);
                 }
             }
             Some(_) => {
@@ -288,7 +256,6 @@ impl Tokenizer {
             model,
             token_to_id,
             id_to_token: tokens,
-            merges,
             merge_ranks,
             token_types,
             bos_id,

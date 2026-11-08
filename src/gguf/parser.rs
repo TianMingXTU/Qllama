@@ -1,4 +1,4 @@
-//! GGUF file parser
+//! GGUF v3 文件索引解析；权重字节的解码在 `loader`/`weight`。
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -19,15 +19,12 @@ const GGML_MAX_NAME: usize = 64;
 /// GGUF 规范对 metadata 键名的长度上限。
 const MAX_METADATA_KEY_BYTES: usize = 65535;
 
-/// GGUF file parser
+/// 已解析的 GGUF 索引。
 pub struct GgufFile {
-    /// File header
     pub header: GgufHeader,
-    /// Metadata key-value pairs
     pub metadata: HashMap<String, GgufValue>,
-    /// Tensor information list
     pub tensor_infos: Vec<TensorInfo>,
-    /// Offset to tensor data start
+    /// 权重数据段在文件中的起始偏移。
     pub tensor_data_offset: u64,
     /// 权重数据段的内存映射；仅 `from_path` 构造时存在。
     ///
@@ -49,12 +46,10 @@ impl GgufFile {
         })
     }
 
-    /// Parse a GGUF file from a reader
+    /// 从任意可读流解析索引；权重数据段不映射，loader 会给出明确错误。
     pub fn from_reader<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
-        // Read header
         let header = Self::read_header(reader).map_err(|error| with_section("header", error))?;
 
-        // Validate magic
         if &header.magic != b"GGUF" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -64,7 +59,6 @@ impl GgufFile {
 
         Self::validate_version(header.version)?;
 
-        // Read metadata
         let metadata = Self::read_metadata(reader, header.metadata_kv_count)
             .map_err(|error| with_section("metadata", error))?;
 
@@ -325,23 +319,19 @@ impl GgufFile {
         })
     }
 
-    /// Get tensor count
     pub fn tensor_count(&self) -> u64 {
         self.header.tensor_count
     }
 
-    /// Get metadata count
     pub fn metadata_count(&self) -> u64 {
         self.header.metadata_kv_count
     }
 
-    /// Find tensor by name
+    /// 按名称定位张量索引项；解析时已拒绝重名，命中项至多一个。
     pub fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensor_infos.iter().find(|t| t.name == name)
     }
 }
-
-// Helper functions for reading binary data
 
 fn read_u8<R: Read>(reader: &mut R) -> io::Result<u8> {
     let mut buf = [0u8; 1];

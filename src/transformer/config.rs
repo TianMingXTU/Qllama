@@ -31,7 +31,7 @@ pub struct TransformerConfig {
 }
 
 impl TransformerConfig {
-    /// Create a new configuration
+    /// 构造配置；`rms_norm_eps` 与 `rope_theta` 取 llama.cpp 默认值。
     pub fn new(
         hidden_size: usize,
         intermediate_size: usize,
@@ -54,7 +54,7 @@ impl TransformerConfig {
         }
     }
 
-    /// Get head dimension
+    /// 每头维度。整除性由 [`Self::from_gguf`] 与测试构造方校验，这里不重复检查。
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
@@ -161,31 +161,5 @@ impl TransformerConfig {
             rms_norm_eps,
             rope_theta,
         })
-    }
-
-    /// Create Llama-7B like configuration
-    pub fn llama_7b() -> Self {
-        Self::new(
-            4096,  // hidden_size
-            11008, // intermediate_size
-            32,    // num_attention_heads
-            32,    // num_kv_heads
-            32,    // num_layers
-            32000, // vocab_size
-            2048,  // max_position_embeddings
-        )
-    }
-
-    /// Create Llama-13B like configuration
-    pub fn llama_13b() -> Self {
-        Self::new(
-            5120,  // hidden_size
-            13824, // intermediate_size
-            40,    // num_attention_heads
-            40,    // num_kv_heads
-            40,    // num_layers
-            32000, // vocab_size
-            2048,  // max_position_embeddings
-        )
     }
 }

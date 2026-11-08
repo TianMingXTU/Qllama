@@ -1,5 +1,5 @@
-//! Tokenizer：文本 ↔ token id（BPE，元数据来自 GGUF）
+//! 分词器：文本 ↔ token id，词表与算法参数来自 GGUF 元数据。
 
-mod tokenizer;
+mod vocab;
 
-pub use tokenizer::{EncodeOptions, StreamingDecoder, TokenType, Tokenizer};
+pub use vocab::{EncodeOptions, StreamingDecoder, TokenType, Tokenizer};

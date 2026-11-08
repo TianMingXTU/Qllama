@@ -1,4 +1,4 @@
-//! KV Cache management
+//! 推理期 K/V 缓存。
 
 mod cache;
 

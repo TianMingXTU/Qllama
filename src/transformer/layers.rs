@@ -194,7 +194,7 @@ impl From<Linear> for Projection {
 impl Projection {
     pub(crate) fn mapped(weight: MappedWeight) -> Result<Self, String> {
         if weight.dims().len() != 2 {
-            return Err(format!("Linear weight must be 2D, got {:?}", weight.dims()));
+            return Err(format!("Mapped weight must be 2D, got {:?}", weight.dims()));
         }
         Ok(Self::Mapped(weight))
     }
