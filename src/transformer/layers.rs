@@ -49,6 +49,7 @@
 use crate::gguf::MappedWeight;
 use crate::kv_cache::KvCache;
 use crate::tensor::{Tensor, TensorOps};
+use rayon;
 
 /// 词嵌入：按 token id 取权重行。
 ///
@@ -410,6 +411,8 @@ impl Attention {
         // 5. 逐头计算。matmul 只接受二维，因此这里按头切出子矩阵。
         let group = self.num_heads / self.num_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(1);
         let mut heads = Vec::with_capacity(self.num_heads);
         for head in 0..self.num_heads {
             let q_h = head_matrix(&q, head, seq_len, head_dim)?;
@@ -472,22 +475,27 @@ impl Attention {
         let new_len = hidden_states.dims()[0];
         let head_dim = self.head_dim;
 
-        // 1. Q/K/V 投影，只算新段。
-        let q = self.wq.forward(hidden_states)?;
-        let k = self.wk.forward(hidden_states)?;
-        let v = self.wv.forward(hidden_states)?;
+        let q = profile_call!(Query, self.wq.forward(hidden_states))?;
+        let k = profile_call!(Key, self.wk.forward(hidden_states))?;
+        let v = profile_call!(Value, self.wv.forward(hidden_states))?;
 
-        // 2. 拆头。
         let q = q.reshape(vec![new_len, self.num_heads, head_dim])?;
         let k = k.reshape(vec![new_len, self.num_kv_heads, head_dim])?;
         let v = v.reshape(vec![new_len, self.num_kv_heads, head_dim])?;
+        let (q, k) = profile_call!(Rope, {
+            (
+                q.rope(head_dim, start_pos, self.rope_theta)?,
+                k.rope(head_dim, start_pos, self.rope_theta)?,
+            )
+        });
 
-        // 3. RoPE：只旋转新段，位置从 start_pos 起算。
-        let q = q.rope(head_dim, start_pos, self.rope_theta)?;
-        let k = k.rope(head_dim, start_pos, self.rope_theta)?;
+        #[cfg(feature = "profile")]
+        let attention_span = crate::profile::Span::new(crate::profile::Stage::Attention);
 
         // 4. 写入 cache，再按"全部历史 + 新段"读回。绝对位置换算 i32 的
         //    溢出与越界都由 KvCache 校验，这里先把转换错误显式报出。
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(usize::from(new_len > 0));
         let positions: Vec<i32> = (0..new_len)
             .map(|offset| {
                 let position = start_pos
@@ -501,6 +509,8 @@ impl Attention {
         kv_cache.update(layer_idx, &k, &v, &positions)?;
 
         let total_len = start_pos + new_len;
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(usize::from(total_len > 0));
         let all_positions: Vec<i32> = (0..total_len)
             .map(|position| {
                 i32::try_from(position).map_err(|_| {
@@ -518,6 +528,8 @@ impl Attention {
         // 6. 逐头计算：查询是 new_len 行，键是 total_len 列。
         let group = self.num_heads / self.num_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(1);
         let mut heads = Vec::with_capacity(self.num_heads);
         for head in 0..self.num_heads {
             let q_h = head_matrix(&q, head, new_len, head_dim)?;
@@ -542,8 +554,9 @@ impl Attention {
         }
         let merged = Tensor::new(merged_data, vec![new_len, self.num_heads * head_dim]);
 
-        // 8. 输出投影。
-        self.wo.forward(&merged)
+        #[cfg(feature = "profile")]
+        drop(attention_span);
+        profile_call!(Output, self.wo.forward(&merged))
     }
 }
 
@@ -667,10 +680,15 @@ impl Mlp {
 
     /// 输入 `[seq_len, hidden_size]`，输出 `[seq_len, hidden_size]`。
     pub fn forward(&self, input: &Tensor) -> Result<Tensor, String> {
-        let gate = self.gate_proj.forward(input)?;
-        let up = self.up_proj.forward(input)?;
-        let hidden = gate.silu()?.mul(&up)?;
-        self.down_proj.forward(&hidden)
+        // gate 和 up 投影相互独立，使用 rayon::join 并行执行以节省时间
+        let (gate, up) = rayon::join(
+            || profile_call!(Gate, self.gate_proj.forward(input)),
+            || profile_call!(Up, self.up_proj.forward(input)),
+        );
+        let gate = gate?;
+        let up = up?;
+        let hidden = profile_call!(Activation, gate.silu()?.mul(&up))?;
+        profile_call!(Down, self.down_proj.forward(&hidden))
     }
 }
 
@@ -715,14 +733,14 @@ impl TransformerBlock {
         kv_cache: &mut KvCache,
         layer_idx: usize,
     ) -> Result<Tensor, String> {
-        let normed = self.input_layernorm.forward(hidden_states)?;
+        let normed = profile_call!(RmsNorm, self.input_layernorm.forward(hidden_states))?;
         let attended = self
             .self_attn
             .forward_with_cache(&normed, start_pos, kv_cache, layer_idx)?;
-        let residual = hidden_states.add(&attended)?;
+        let residual = profile_call!(Residual, hidden_states.add(&attended))?;
 
-        let normed = self.post_attention_layernorm.forward(&residual)?;
+        let normed = profile_call!(RmsNorm, self.post_attention_layernorm.forward(&residual))?;
         let fed_forward = self.mlp.forward(&normed)?;
-        residual.add(&fed_forward)
+        profile_call!(Residual, residual.add(&fed_forward))
     }
 }

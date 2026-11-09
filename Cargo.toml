@@ -22,8 +22,13 @@ name = "bench"
 path = "src/bin/bench.rs"
 required-features = ["bench"]
 
+[[example]]
+name = "profile_decode"
+required-features = ["profile"]
+
 [features]
 bench = []
+profile = ["bench"]
 
 [dependencies]
 # 并行计算

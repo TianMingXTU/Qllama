@@ -288,14 +288,18 @@ impl Transformer {
             ));
         }
 
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let mut hidden_states = profile_call!(Embedding, self.embed_tokens.forward(input_ids))?;
         for (index, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "profile")]
+            crate::profile::set_layer(Some(index));
             hidden_states = layer
                 .forward_with_cache(&hidden_states, start_pos, kv_cache, index)
                 .map_err(|error| format!("Layer {index} failed: {error}"))?;
         }
-        let hidden_states = self.norm.forward(&hidden_states)?;
-        self.lm_head.forward(&hidden_states)
+        #[cfg(feature = "profile")]
+        crate::profile::set_layer(None);
+        let hidden_states = profile_call!(FinalNorm, self.norm.forward(&hidden_states))?;
+        profile_call!(LmHead, self.lm_head.forward(&hidden_states))
     }
 }
 

@@ -86,7 +86,10 @@ fn matmul_accumulates_sequentially_in_f32() {
 }
 
 #[test]
-fn single_row_matmul_preserves_accumulation_order_across_threads_and_column_tails() {
+fn single_row_matmul_preserves_deterministic_f32_results() {
+    // 当前实现使用 par_chunks_mut(columns)，当 rows==1 时只产生一个 chunk，
+    // 退化为单线程 i-k-j 顺序累加；若未来改为列分块并行，此测试保证
+    // 任意线程数下结果仍与原累积顺序逐位一致。
     let shared = 257;
     for columns in [63, 64, 65, 129, 513] {
         let input: Vec<f32> = (0..shared)
