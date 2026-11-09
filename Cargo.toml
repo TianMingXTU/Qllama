@@ -17,6 +17,14 @@ path = "src/lib.rs"
 name = "qllama"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]
+
+[features]
+bench = []
+
 [dependencies]
 # 并行计算
 rayon = "1.10"

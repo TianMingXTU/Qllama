@@ -144,6 +144,12 @@ impl Transformer {
         &self.config
     }
 
+    /// 基准入口借用真实层权重，不复制或重新装配整个模型。
+    #[cfg(feature = "bench")]
+    pub fn attention_layer(&self, index: usize) -> Option<&Attention> {
+        self.layers.get(index).map(|layer| &layer.self_attn)
+    }
+
     /// 从已解析的 GGUF 文件装配整个模型。
     ///
     /// 张量名按 llama.cpp `llama-arch.cpp` 的 `LLM_TENSOR` 映射表拼装：
