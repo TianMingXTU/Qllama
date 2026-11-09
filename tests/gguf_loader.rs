@@ -221,6 +221,64 @@ fn mapped_quantized_matmul_handles_multiple_rows_without_transposing_storage() {
 }
 
 #[test]
+fn mapped_single_row_matmul_preserves_bits_across_threads_and_column_tails() {
+    let width = 64;
+    for type_id in [0, 1, 2, 8] {
+        for columns in [63, 64, 65, 129] {
+            let mut bytes = Vec::new();
+            for row in 0..columns {
+                if type_id <= 1 {
+                    for inner in 0..width {
+                        let bits = [0x3555u16, 0xbc00, 0x3800, 0x4000][(row + inner) % 4];
+                        if type_id == 1 {
+                            bytes.extend_from_slice(&bits.to_le_bytes());
+                        } else {
+                            let value = ((row * 17 + inner * 29) % 101) as f32 / 13.0 - 3.0;
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                } else {
+                    for block in 0..width / 32 {
+                        let scale = [0x3555u16, 0xbc00, 0x3800][(row + block) % 3];
+                        bytes.extend_from_slice(&scale.to_le_bytes());
+                        let size = if type_id == 2 { 16 } else { 32 };
+                        bytes.extend((0..size).map(|i| ((row * 17 + block * 29 + i * 31) % 256) as u8));
+                    }
+                }
+            }
+            let path = write_gguf(
+                &format!("mapped-thread-{type_id}-{columns}"),
+                &[TensorSpec::raw("w", vec![width as u64, columns as u64], type_id, bytes)],
+                32,
+            );
+            let weight = GgufFile::from_path(&path).unwrap().load_weight("w").unwrap();
+            let input: Vec<f32> = (0..width).map(|i| (i as f32 - 31.0) / 11.0).collect();
+            let expected: Vec<u32> = (0..columns)
+                .map(|row| {
+                    let values = weight.read_row(row).unwrap();
+                    let mut sum = 0.0f32;
+                    for inner in 0..width {
+                        sum += input[inner] * values[inner];
+                    }
+                    sum.to_bits()
+                })
+                .collect();
+            let input = qllama::Tensor::new(input, vec![1, width]);
+            for threads in [1, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                let actual = pool.install(|| weight.matmul(&input)).unwrap();
+                assert_eq!(actual.dims(), &[1, columns]);
+                assert_eq!(
+                    actual.data().iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    expected,
+                    "type={type_id}, columns={columns}, threads={threads}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn mapped_quantized_zero_and_negative_scales_are_respected() {
     for (name, scale, expected) in [("zero", 0x0000u16, 0.0), ("negative", 0xbc00u16, 8.0)] {
         let mut bytes = scale.to_le_bytes().to_vec();

@@ -7,16 +7,28 @@ use std::sync::Arc;
 /// `data` 经 `Arc` 共享，`view`/`reshape` 只复制元数据不复制缓冲；写操作
 /// （`set`）经 `Arc::make_mut` 触发写时复制，不影响其他视图。`new` 不校验
 /// 维度乘积与缓冲长度是否一致，重排类运算在用坐标换算前会拦下这种畸形输入。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[cfg_attr(not(feature = "profile"), derive(Clone))]
 pub struct Tensor {
     data: Arc<Vec<f32>>,
     dims: Vec<usize>,
     strides: Vec<usize>,
 }
 
+#[cfg(feature = "profile")]
+impl Clone for Tensor {
+    fn clone(&self) -> Self {
+        self.view()
+    }
+}
+
 impl Tensor {
     /// 从扁平缓冲与维度构造张量，按行主序计算 strides。
     pub fn new(data: Vec<f32>, dims: Vec<usize>) -> Self {
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(
+            1 + usize::from(data.capacity() > 0) + usize::from(dims.capacity() > 0),
+        );
         let strides = compute_strides(&dims);
         Self {
             data: Arc::new(data),
@@ -64,6 +76,10 @@ impl Tensor {
 
     /// 共享同一缓冲的等价张量（复制元数据，不复制数据）。
     pub fn view(&self) -> Self {
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(
+            usize::from(!self.dims.is_empty()) + usize::from(!self.strides.is_empty()),
+        );
         Self {
             data: Arc::clone(&self.data),
             dims: self.dims.clone(),
@@ -82,6 +98,8 @@ impl Tensor {
             ));
         }
 
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(usize::from(new_dims.capacity() > 0));
         let strides = compute_strides(&new_dims);
         Ok(Self {
             data: Arc::clone(&self.data),
@@ -112,6 +130,10 @@ impl Tensor {
                 self.data.len()
             ));
         }
+        #[cfg(feature = "profile")]
+        if Arc::strong_count(&self.data) > 1 {
+            crate::profile::allocations(1 + usize::from(self.data.capacity() > 0));
+        }
         Arc::make_mut(&mut self.data)[flat] = value;
         Ok(())
     }
@@ -138,6 +160,8 @@ impl Tensor {
         let new_strides = compute_strides(&new_dims);
 
         let mut data = vec![0.0f32; self.len()];
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(usize::from(rank > 0));
         let mut coords = vec![0usize; rank];
         for _ in 0..self.len() {
             // coords 始终按旧轴顺序维护：先用旧 strides 定位源元素，
@@ -176,6 +200,8 @@ impl Tensor {
 
         let new_size: usize = new_dims.iter().product();
         let mut data = Vec::with_capacity(new_size);
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(usize::from(rank > 0));
         let mut coords = vec![0usize; rank];
         for _ in 0..new_size {
             // 新坐标与旧坐标仅 axis 上相差 start，其余轴的加权和可直接复用。
@@ -257,6 +283,8 @@ fn compute_strides(dims: &[usize]) -> Vec<usize> {
         return vec![];
     }
 
+    #[cfg(feature = "profile")]
+    crate::profile::allocations(1);
     let mut strides = vec![0; ndim];
     strides[ndim - 1] = 1;
     for i in (0..ndim - 1).rev() {

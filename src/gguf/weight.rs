@@ -104,6 +104,8 @@ impl MappedWeight {
             return Err(format!("Weight row {row} is out of range"));
         }
         let bytes = self.row(row);
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(1);
         let mut values = Vec::with_capacity(width);
         match self.dtype {
             GgmlType::F32 => values.extend(bytes.as_chunks::<4>().0.iter().map(|c| read_f32(c))),
