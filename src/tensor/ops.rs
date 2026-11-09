@@ -3,6 +3,38 @@
 use super::Tensor;
 use rayon::prelude::*;
 
+/// `rows == 1` 时密集 GEMV 的列分块大小。
+///
+/// 当输入只有 1 行时，`data.par_chunks_mut(columns)` 只产生一个 chunk，Rayon
+/// 不会起任何并行任务。此时改为按列分块：每个块内遍历整个 shared 维做点积并
+/// 写入对应输出段；各块互不竞争同一位置，顺序与 i-k-j 全串行等价。
+/// BLOCK=64 是权衡结果：太小导致任务数膨胀（调度开销 > 计算开销），太大则
+/// 短矩阵尾块过大、长矩阵收益有限；64 覆盖了 TinyLlama hidden=2048 这类规模。
+const GEMV_COL_BLOCK: usize = 64;
+
+/// 计算 `[1, shared] × [shared, columns] -> [1, columns]` 的密集 GEMM。
+///
+/// 外层按列分块并行；每个线程独占一个列区间，对共享维顺序累加，保证与串行
+/// i-k-j 等价的 IEEE f32 结果。调用方负责持有输出 buffer 的安全写权限。
+#[inline]
+fn matmul_row_parallel(out: &mut [f32], input: &[f32], other: &[f32], columns: usize) {
+    let rows = other.chunks_exact(columns);
+    for start in (0..columns).step_by(GEMV_COL_BLOCK) {
+        let end = (start + GEMV_COL_BLOCK).min(columns);
+        // 闭包捕获不可 Send 的值时显式 move；par_iter_mut 会校验 Send。
+        let mut buf = vec![0.0f32; end - start];
+        buf.par_iter_mut().enumerate().for_each(|(offset, acc)| {
+            let col = start + offset;
+            let mut s = 0.0;
+            for (left, right_row) in input.iter().zip(rows.clone()) {
+                s += left * right_row[col];
+            }
+            *acc = s;
+        });
+        out[start..end].copy_from_slice(&buf);
+    }
+}
+
 /// 张量算子；结果不修改输入或其共享视图。
 ///
 /// 所有方法均校验形状与缓冲区长度；形状乘积或步长溢出时返回错误。
@@ -78,17 +110,22 @@ impl TensorOps for Tensor {
         let dims = vec![rows, columns];
         let mut data = zeroed_data(checked_size(&dims)?)?;
         if !data.is_empty() && shared != 0 {
-            data.par_chunks_mut(columns)
-                .enumerate()
-                .for_each(|(row_index, output_row)| {
-                    let left_row = &self.data()[row_index * shared..(row_index + 1) * shared];
-                    for (inner, &left) in left_row.iter().enumerate() {
-                        let right_row = &other.data()[inner * columns..(inner + 1) * columns];
-                        for (output, &right) in output_row.iter_mut().zip(right_row) {
-                            *output += left * right;
+            if rows == 1 {
+                let input_row = &self.data()[..shared];
+                matmul_row_parallel(&mut data, input_row, other.data(), columns);
+            } else {
+                data.par_chunks_mut(columns)
+                    .enumerate()
+                    .for_each(|(row_index, output_row)| {
+                        let left_row = &self.data()[row_index * shared..(row_index + 1) * shared];
+                        for (inner, &left) in left_row.iter().enumerate() {
+                            let right_row = &other.data()[inner * columns..(inner + 1) * columns];
+                            for (output, &right) in output_row.iter_mut().zip(right_row) {
+                                *output += left * right;
+                            }
                         }
-                    }
-                });
+                    });
+            }
         }
         Ok(Tensor::new(data, dims))
     }
@@ -190,6 +227,8 @@ impl TensorOps for Tensor {
             return Ok(self.clone());
         }
 
+        #[cfg(feature = "profile")]
+        crate::profile::allocations(1);
         let frequencies: Vec<f64> = (0..head_dim / 2)
             .map(|pair| f64::from(theta).powf(-2.0 * pair as f64 / head_dim as f64))
             .collect();
@@ -337,6 +376,8 @@ fn broadcast_shape(left: &[usize], right: &[usize]) -> Result<Vec<usize>, String
 }
 
 fn broadcast_strides(tensor: &Tensor, rank: usize) -> Vec<usize> {
+    #[cfg(feature = "profile")]
+    crate::profile::allocations(usize::from(rank > 0));
     let mut strides = vec![0; rank];
     let offset = rank - tensor.ndim();
     for (axis, &dim) in tensor.dims().iter().enumerate() {

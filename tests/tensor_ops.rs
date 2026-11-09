@@ -86,6 +86,40 @@ fn matmul_accumulates_sequentially_in_f32() {
 }
 
 #[test]
+fn single_row_matmul_preserves_accumulation_order_across_threads_and_column_tails() {
+    let shared = 257;
+    for columns in [63, 64, 65, 129, 513] {
+        let input: Vec<f32> = (0..shared)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..shared * columns)
+            .map(|i| ((i * 29 % 97) as f32 - 48.0) / 11.0)
+            .collect();
+        let expected: Vec<u32> = (0..columns)
+            .map(|column| {
+                let mut sum = 0.0f32;
+                for inner in 0..shared {
+                    sum += input[inner] * weights[inner * columns + column];
+                }
+                sum.to_bits()
+            })
+            .collect();
+        let input = Tensor::new(input, vec![1, shared]);
+        let weights = Tensor::new(weights, vec![shared, columns]);
+        for threads in [1, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let actual = pool.install(|| input.matmul(&weights)).unwrap();
+            assert_eq!(actual.dims(), &[1, columns]);
+            assert_eq!(
+                actual.data().iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected,
+                "columns={columns}, threads={threads}"
+            );
+        }
+    }
+}
+
+#[test]
 fn matmul_rejects_inner_dimension_mismatch() {
     assert!(Tensor::ones(vec![2, 3])
         .matmul(&Tensor::ones(vec![2, 2]))
