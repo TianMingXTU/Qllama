@@ -17,11 +17,29 @@
   冒烟：3 个不同 prompt 产出 3 段不同且连贯的续写。
 - 提交：5437ebd feat(server)，37a796f test(server)。
 
-## 待办（Phase 3-4）
+## 2026-11-11 Phase 3（稳定性/安全）
 
-- Phase 3: proptest 模糊（GGUF/tokenizer，新 dev 依赖需说明）、优雅退出
-  实测（SIGTERM→drain→exit 0）、KV 预算 503 实测、1000 请求压测 RSS<5%。
-- Phase 4: Dockerfile/compose/systemd/config.example.json、docs/api.md、
-  docs/ops-runbook.md、docs/roadmap.md、CHANGELOG、README 快速开始、--version。
+- 模糊测试 tests/fuzz.rs（proptest，任务书点名依赖）：GGUF 解析器任意
+  字节/截断/合法头+垃圾尾巴 512 case 不 panic；分词器任意文本编码 id
+  在词表内、流式解码不 panic。5 项通过（0.44s）。
+- 资源保护实测：`--kv-budget-mib 0` 下请求返回 503 service_unavailable
+  （集成测试 `kv_budget_rejects_with_503`）。
+- 优雅排空实测（库级 `graceful_shutdown_drains_accepted_sessions`）：
+  submit 通道关闭后调度线程把已接受的 2 个请求跑完再退出，join 干净。
+  进程级 SIGTERM 路径在 Windows 不能自动化，runbook 记录手动验证。
+- 安全默认复核：仅回环监听、--model-dir 白名单（Engine::load canonicalize
+  + starts_with）、--api-key 常量时间比较、stderr 日志不含 prompt。
+- 压测：1000 请求 soak（`--ignored`，RSS 基线/终值实测数据见本文件后续
+  追加行；失败即停）。
+
+## 2026-11-11 Phase 4（交付/运维）
+
+- --version（clap）、--config（JSON，deny_unknown_fields，CLI 覆盖配置），
+  均已真实启动/错误路径验证。
+- 部署：Dockerfile（多阶段/非 root/HEALTHCHECK/VOLUME）、compose（回环
+  端口绑定）、systemd（ProtectSystem=strict 等加固）、config.example.json。
+- 文档：docs/api.md、docs/ops-runbook.md、docs/roadmap.md（三层级+理由）、
+  CHANGELOG、README 快速开始、docs/development-plan.md 服务化勾选。
 - 已知偏差：KV 预算从"token 数"改为"字节数"（token 数无法换算成真实内存
-  压力，见 Limits 注释）；chat 模板为降级 ChatML（ADR 0004）。
+  压力，见 Limits 注释）；chat 模板为降级 ChatML（ADR 0004）；批处理和
+  jinja 模板在 roadmap 下一阶段。

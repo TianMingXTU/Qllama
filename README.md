@@ -210,10 +210,16 @@ Qllama/
 ├── tests/                  # 集成测试
 │   ├── gguf_parser.rs      # GGUF 解析
 │   ├── tensor_ops.rs       # Tensor 运算
-│   └── cli.rs              # CLI 用户路径（含 GGUF 夹具生成）
+│   ├── cli.rs              # CLI 用户路径（含 GGUF 夹具生成）
+│   ├── server_integration.rs # HTTP 服务集成测试（进程级）
+│   └── fuzz.rs             # proptest 模糊测试
 └── src/
     ├── lib.rs              # 库入口
     ├── main.rs             # CLI 入口
+    ├── bin/server.rs       # HTTP 服务入口（qllama-server）
+    ├── server/             # 服务层（server feature）
+    │   ├── mod.rs          # Engine / Session / Scheduler
+    │   └── api.rs          # HTTP 路由 / SSE / 错误体
     ├── gguf/               # GGUF 解析
     │   ├── parser.rs       # 索引解析
     │   ├── loader.rs       # 张量数据解码
