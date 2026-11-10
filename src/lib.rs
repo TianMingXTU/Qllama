@@ -19,6 +19,8 @@ pub mod profile;
 pub mod gguf;
 pub mod kv_cache;
 pub mod sampler;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod tensor;
 pub mod tokenizer;
 pub mod transformer;
