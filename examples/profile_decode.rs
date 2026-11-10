@@ -51,7 +51,10 @@ fn main() -> anyhow::Result<()> {
 fn run(args: &Args) -> anyhow::Result<()> {
     let gguf = GgufFile::from_path(&args.model).map_err(anyhow::Error::msg)?;
     let model = Transformer::from_gguf(&gguf).map_err(anyhow::Error::msg)?;
-    ensure!(args.ctx_size > 0 && args.ctx_size <= model.config().max_position_embeddings, "Invalid context capacity");
+    ensure!(
+        args.ctx_size > 0 && args.ctx_size <= model.config().max_position_embeddings,
+        "Invalid context capacity"
+    );
     if args.attention_only {
         return profile_attention(args, &model);
     }
@@ -97,7 +100,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
         }
         let wall_seconds = started.elapsed().as_secs_f64();
         if measured {
-            rows.push(snapshot_row(profile::finish(), run - args.warmup + 1, args.steps, wall_seconds));
+            rows.push(snapshot_row(
+                profile::finish(),
+                run - args.warmup + 1,
+                args.steps,
+                wall_seconds,
+            ));
         }
         eprintln!(
             "profile run {}/{} complete (warmup={})",
@@ -124,11 +132,20 @@ fn run(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn snapshot_row(snapshot: profile::Snapshot, run: usize, steps: usize, wall_seconds: f64) -> serde_json::Value {
+fn snapshot_row(
+    snapshot: profile::Snapshot,
+    run: usize,
+    steps: usize,
+    wall_seconds: f64,
+) -> serde_json::Value {
     let mut stages = Vec::new();
     let mut allocations = snapshot.model.allocations;
     for (layer, timings) in std::iter::once((None, &snapshot.model)).chain(
-        snapshot.layers.iter().enumerate().map(|(index, timings)| (Some(index), timings)),
+        snapshot
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, timings)| (Some(index), timings)),
     ) {
         for stage in Stage::ALL {
             let index = stage as usize;
@@ -158,41 +175,73 @@ fn snapshot_row(snapshot: profile::Snapshot, run: usize, steps: usize, wall_seco
 fn profile_attention(args: &Args, model: &Transformer) -> anyhow::Result<()> {
     let config = model.config();
     let history = args.ctx_size - 1;
-    let positions = (0..history).map(|i| i32::try_from(i).context("Position exceeds i32")).collect::<anyhow::Result<Vec<_>>>()?;
+    let positions = (0..history)
+        .map(|i| i32::try_from(i).context("Position exceeds i32"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let shape = vec![history, config.num_kv_heads, config.head_dim()];
     let count: usize = shape.iter().product();
-    let k = Tensor::new((0..count).map(|i| (i % 251) as f32 / 512.0 - 0.25).collect(), shape.clone());
-    let v = Tensor::new((0..count).map(|i| (i % 239) as f32 / 512.0 - 0.25).collect(), shape);
-    let hidden = Tensor::new((0..config.hidden_size).map(|i| (i % 127) as f32 / 512.0).collect(), vec![1, config.hidden_size]);
+    let k = Tensor::new(
+        (0..count)
+            .map(|i| (i % 251) as f32 / 512.0 - 0.25)
+            .collect(),
+        shape.clone(),
+    );
+    let v = Tensor::new(
+        (0..count)
+            .map(|i| (i % 239) as f32 / 512.0 - 0.25)
+            .collect(),
+        shape,
+    );
+    let hidden = Tensor::new(
+        (0..config.hidden_size)
+            .map(|i| (i % 127) as f32 / 512.0)
+            .collect(),
+        vec![1, config.hidden_size],
+    );
     let attention = model.attention_layer(0).context("No layer 0")?;
     let mut cache = KvCache::new(1, args.ctx_size, config.num_kv_heads, config.head_dim());
     let mut rows = Vec::new();
     for run in 0..args.warmup + args.runs {
         cache.clear();
-        cache.update(0, &k, &v, &positions).map_err(anyhow::Error::msg)?;
+        cache
+            .update(0, &k, &v, &positions)
+            .map_err(anyhow::Error::msg)?;
         let measured = run >= args.warmup;
         if measured {
             profile::start(1);
         }
         let started = Instant::now();
-        let output = attention.forward_with_cache(&hidden, history, &mut cache, 0).map_err(anyhow::Error::msg)?;
+        let output = attention
+            .forward_with_cache(&hidden, history, &mut cache, 0)
+            .map_err(anyhow::Error::msg)?;
         std::hint::black_box(&output);
         let elapsed = started.elapsed().as_secs_f64();
         if measured {
-            rows.push(snapshot_row(profile::finish(), run - args.warmup + 1, 1, elapsed));
+            rows.push(snapshot_row(
+                profile::finish(),
+                run - args.warmup + 1,
+                1,
+                elapsed,
+            ));
         }
-        ensure!(output.data().iter().all(|v| v.is_finite()), "Non-finite attention output");
+        ensure!(
+            output.data().iter().all(|v| v.is_finite()),
+            "Non-finite attention output"
+        );
     }
-    println!("{}", json!({
-        "kind": "single_layer_attention_synthetic_history",
-        "model": args.model,
-        "threads": args.threads.get(),
-        "ctx_size": args.ctx_size,
-        "actual_history_tokens": history,
-        "warmup": args.warmup,
-        "runs": rows,
-        "note": "Real layer weights; synthetic RoPE-space K, V and hidden states. Not full-model long-prompt decode throughput.",
-    }));
+    println!(
+        "{}",
+        json!({
+            "kind": "single_layer_attention_synthetic_history",
+            "model": args.model,
+            "threads": args.threads.get(),
+            "ctx_size": args.ctx_size,
+            "actual_history_tokens": history,
+            "warmup": args.warmup,
+            "runs": rows,
+            "note": "Real layer weights; synthetic RoPE-space K, V and hidden states. Not full-model long-prompt decode throughput.",
+        })
+    );
     Ok(())
 }
 

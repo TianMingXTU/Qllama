@@ -110,11 +110,18 @@ fn single_row_matmul_preserves_deterministic_f32_results() {
         let input = Tensor::new(input, vec![1, shared]);
         let weights = Tensor::new(weights, vec![shared, columns]);
         for threads in [1, 2, 4, 8] {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
             let actual = pool.install(|| input.matmul(&weights)).unwrap();
             assert_eq!(actual.dims(), &[1, columns]);
             assert_eq!(
-                actual.data().iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                actual
+                    .data()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
                 expected,
                 "columns={columns}, threads={threads}"
             );

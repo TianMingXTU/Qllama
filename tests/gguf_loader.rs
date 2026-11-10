@@ -242,16 +242,26 @@ fn mapped_single_row_matmul_preserves_bits_across_threads_and_column_tails() {
                         let scale = [0x3555u16, 0xbc00, 0x3800][(row + block) % 3];
                         bytes.extend_from_slice(&scale.to_le_bytes());
                         let size = if type_id == 2 { 16 } else { 32 };
-                        bytes.extend((0..size).map(|i| ((row * 17 + block * 29 + i * 31) % 256) as u8));
+                        bytes.extend(
+                            (0..size).map(|i| ((row * 17 + block * 29 + i * 31) % 256) as u8),
+                        );
                     }
                 }
             }
             let path = write_gguf(
                 &format!("mapped-thread-{type_id}-{columns}"),
-                &[TensorSpec::raw("w", vec![width as u64, columns as u64], type_id, bytes)],
+                &[TensorSpec::raw(
+                    "w",
+                    vec![width as u64, columns as u64],
+                    type_id,
+                    bytes,
+                )],
                 32,
             );
-            let weight = GgufFile::from_path(&path).unwrap().load_weight("w").unwrap();
+            let weight = GgufFile::from_path(&path)
+                .unwrap()
+                .load_weight("w")
+                .unwrap();
             let input: Vec<f32> = (0..width).map(|i| (i as f32 - 31.0) / 11.0).collect();
             let expected: Vec<u32> = (0..columns)
                 .map(|row| {
@@ -265,11 +275,18 @@ fn mapped_single_row_matmul_preserves_bits_across_threads_and_column_tails() {
                 .collect();
             let input = qllama::Tensor::new(input, vec![1, width]);
             for threads in [1, 2, 4, 8] {
-                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
                 let actual = pool.install(|| weight.matmul(&input)).unwrap();
                 assert_eq!(actual.dims(), &[1, columns]);
                 assert_eq!(
-                    actual.data().iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    actual
+                        .data()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
                     expected,
                     "type={type_id}, columns={columns}, threads={threads}"
                 );
