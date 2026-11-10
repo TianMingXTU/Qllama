@@ -18,6 +18,11 @@ name = "qllama"
 path = "src/main.rs"
 
 [[bin]]
+name = "qllama-server"
+path = "src/bin/server.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
 required-features = ["bench"]
@@ -29,6 +34,8 @@ required-features = ["profile"]
 [features]
 bench = []
 profile = ["bench"]
+# HTTP 服务层：qllama-server 二进制与 OpenAI 兼容 API
+server = ["dep:tokio", "dep:axum", "dep:futures"]
 
 [dependencies]
 # 并行计算
@@ -46,9 +53,31 @@ anyhow = "1.0"
 # 随机采样（Sampler 的可播种随机源）
 rand = "0.8"
 
-[dev-dependencies]
-# examples/ 的 JSON 输入输出
+# HTTP 服务层（仅 server 特性启用；依赖清单见 docs/decisions/0004-api-scope.md）
+# tokio: rt-multi-thread 线程池、net 监听、signal 优雅退出、sync/time 通道与超时
+# axum: OpenAI 兼容路由与 SSE；二者为任务书显式授权的唯一新增运行时依赖
+tokio = { version = "1", optional = true, default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "macros",
+] }
+axum = { version = "0.8", optional = true, default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+] }
+futures = { version = "0.3", optional = true }
+
+# JSON 序列化：服务层请求/响应与 CLI logits 输出共用
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+
+[dev-dependencies]
+# examples/ 与服务层集成测试的 JSON 构造/解析与临时目录
+tempfile = "3.0"
 
 [profile.release]
 opt-level = 3
