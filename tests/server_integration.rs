@@ -441,3 +441,188 @@ fn api_key_required() {
     let (status, _) = read_response(&mut stream);
     assert_eq!(status, 200, "valid api key should be 200");
 }
+
+/// 资源保护（Phase 3.2）：KV 字节预算压到 0 时，任何请求都应得到 503
+/// 而不是让进程尝试分配/崩溃。
+#[test]
+fn kv_budget_rejects_with_503() {
+    let Some(model) = model_path() else {
+        eprintln!("skipping: no test model available");
+        return;
+    };
+    let port = free_port();
+    let bin = env!("CARGO_BIN_EXE_qllama-server");
+    let mut command = Command::new(bin);
+    command.args([
+        "--model",
+        &model,
+        "--listen",
+        &format!("127.0.0.1:{port}"),
+        "--kv-budget-mib",
+        "0",
+    ]);
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn with kv-budget 0");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let (status, text) = post(port, "/v1/completions", "{\"prompt\":\"hi\",\"max_tokens\":8}");
+    assert_eq!(status, 503, "over-budget request must be 503: {text}");
+    let err: Value = serde_json::from_str(&text).expect("error json");
+    assert_eq!(err["error"]["type"], "service_unavailable");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 压测（Phase 3.4）：1000 个请求后 RSS 增长 < 5%。
+///
+/// 标记 `#[ignore]`：串行引擎跑 1000 个请求需要数分钟，不属于常规测试
+/// 范围；验证时用
+/// `cargo test --features server --test server_integration soak -- --ignored --nocapture`
+/// 显式运行并记录结果（docs/progress.md）。
+#[test]
+#[ignore = "long-running soak: run explicitly with --ignored"]
+fn soak_1000_requests_rss_growth_under_5pct() {
+    let Some(server) = start_server(None) else {
+        eprintln!("skipping: no test model available");
+        return;
+    };
+    let pid = server.child.id();
+
+    let rss_kib = |pid: u32| -> Option<u64> {
+        // Windows: tasklist CSV 的内存列为 "xx,xxx K"。
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let field = text.split("\",\"").nth(4)?; // 第 5 列：内存
+        let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().ok()
+    };
+
+    // 预热 10 个请求，让 mmap 页与分配器达到稳态，再取基线。
+    for _ in 0..10 {
+        complete(server.port, "Warmup prompt", 4, false);
+    }
+    let baseline = rss_kib(pid).expect("read baseline RSS");
+
+    // 请求数可配：短曲线（如 300）用于区分预热与泄漏，默认 1000 为验收口径。
+    let total: usize = std::env::var("QLLAMA_SOAK_REQUESTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+        .max(1);
+    let sample_every = (total / 8).max(1);
+    let start = Instant::now();
+    let mut samples = vec![(0usize, baseline)];
+    for i in 0..total {
+        if (i + 1) % 100 == 0 {
+            eprintln!("soak progress: {}/{}", i + 1, total);
+        }
+        let prompt = format!("Request number {} told a story about", i % 32);
+        let v = complete(server.port, &prompt, 8, false);
+        let text = v["choices"][0]["text"].as_str().unwrap_or("");
+        assert!(!text.is_empty(), "request {i} returned empty text");
+        if (i + 1) % sample_every == 0 {
+            let rss = rss_kib(pid).expect("read sample RSS");
+            samples.push((i + 1, rss));
+            eprintln!("soak RSS @{}: {} KiB", i + 1, rss);
+        }
+    }
+    let elapsed = start.elapsed();
+
+    let final_rss = rss_kib(pid).expect("read final RSS");
+    let growth_pct = 100.0 * (final_rss as f64 - baseline as f64) / baseline as f64;
+    println!(
+        "soak: {total} requests in {elapsed:?}; RSS {baseline} KiB -> {final_rss} KiB ({growth_pct:+.2}%)"
+    );
+    println!("soak RSS curve (request, KiB): {samples:?}");
+    assert!(
+        growth_pct < 5.0,
+        "RSS grew {growth_pct:.2}% after {total} requests ({baseline} -> {final_rss} KiB)"
+    );
+}
+
+/// 优雅退出（Phase 3.2，库级）：所有 submit sender drop 后，调度线程必须
+/// 把已接收的请求跑完（不丢弃在途请求）再退出，join 成功。
+///
+/// 进程级 SIGTERM 路径（axum graceful shutdown → 停止接收 → join 调度线程）
+/// 在 Windows 上无法用 std 自动化（CTRL_C_EVENT 不可跨进程投递），
+/// 由 runbook 记录手动验证步骤；此处验证排空机制本身。
+#[test]
+fn graceful_shutdown_drains_accepted_sessions() {
+    use std::path::Path;
+    use std::time::Duration;
+
+    let Some(model) = model_path() else {
+        eprintln!("skipping: no test model available");
+        return;
+    };
+    let engine = qllama::server::Engine::load(Path::new(&model), None, Some(2), None)
+        .expect("load model");
+    let limits = qllama::server::Limits {
+        queue_capacity: 8,
+        request_timeout: Duration::from_secs(60),
+        max_request_bytes: 1 << 20,
+        kv_byte_budget: 512 << 20,
+    };
+    let (state, handle) =
+        qllama::server::ServerState::start(engine, limits, None).expect("start state");
+
+    // 在关闭前提交 2 个请求；sender 引用 state.submit，drop state 即关通道。
+    let mut receivers = Vec::new();
+    for prompt in ["Shutdown story one about", "Shutdown story two about"] {
+        let tokenizer = state.engine.tokenizer.as_ref().unwrap();
+        let prompt_ids = tokenizer.encode(prompt).expect("encode prompt");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .submit
+            .send(qllama::server::Session {
+                request: qllama::server::GenerationRequest {
+                    prompt_ids,
+                    max_tokens: 8,
+                    sampler: qllama::sampler::SamplerConfig {
+                        temperature: 0.7,
+                        top_k: 0,
+                        top_p: 1.0,
+                        repeat_penalty: 1.0,
+                    },
+                    seed: Some(42),
+                    stop_texts: Vec::new(),
+                },
+                events: tx,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })
+            .expect("submit session");
+        receivers.push(rx);
+    }
+
+    // 模拟服务关闭：drop 最后的 submit sender，等调度线程排空退出。
+    drop(state);
+    let join = thread::spawn(move || handle.join());
+    let joined = join.join().expect("join wrapper");
+    joined.expect("scheduler thread exits cleanly after drain");
+
+    // 已接收的请求必须被跑完（Done，而非 Failed/无输出）。
+    for (i, mut rx) in receivers.into_iter().enumerate() {
+        let mut saw_done = false;
+        while let Ok(event) = rx.try_recv() {
+            if let qllama::server::SessionEvent::Done { tokens, .. } = event {
+                assert!(!tokens.is_empty(), "drained session {i} produced no tokens");
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "drained session {i} never completed");
+    }
+}
