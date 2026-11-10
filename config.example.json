@@ -1,0 +1,12 @@
+{
+  "model": "/models/model.gguf",
+  "model_dir": "/models",
+  "listen": "127.0.0.1:8080",
+  "threads": 8,
+  "ctx_size": 2048,
+  "queue_capacity": 32,
+  "request_timeout_secs": 300,
+  "max_request_bytes": 1048576,
+  "api_key": null,
+  "kv_budget_mib": 2048
+}
