@@ -1,0 +1,35 @@
+# systemd 单元（Linux 裸机部署）。
+# 安装：cp deploy/qllama.service /etc/systemd/system/
+#       用户/路径按现场调整后 systemctl daemon-reload && systemctl enable --now qllama
+[Unit]
+Description=Qllama OpenAI-compatible inference server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qllama
+Group=qllama
+# 默认仅回环；对外暴露必须加 --api-key 并改 --listen
+ExecStart=/usr/local/bin/qllama-server --model /var/lib/qllama/model.gguf --listen 127.0.0.1:8080
+# SIGTERM → 停止接收 → 排空在途请求（qllama-server 内建；超时上限 = request-timeout-secs）
+KillSignal=SIGTERM
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=5
+
+# 加固：只给模型目录写权限之外的只读视图
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/qllama
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# 内存上限与 --kv-budget-mib 同向调整：权重 + KV + HTTP 缓冲
+MemoryMax=8G
+
+[Install]
+WantedBy=multi-user.target

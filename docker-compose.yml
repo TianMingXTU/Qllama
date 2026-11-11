@@ -1,0 +1,30 @@
+# 单机部署示例：模型放宿主机 ./models/，服务映射到宿主机回环。
+# 对外暴露时把 127.0.0.1:8080:8080 改成 8080:8080 并务必设置 api_key。
+services:
+  qllama:
+    build: .
+    image: qllama-server:local
+    ports:
+      # 默认只绑宿主机回环；公网部署需同时设置 api_key
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./models:/models:ro
+    command:
+      - "--model"
+      - "/models/model.gguf"
+      - "--listen"
+      - "0.0.0.0:8080"
+      # 生产建议：--api-key <token>
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    # KV cache + 权重都在内存里；按模型规模调整，超限会被内核 OOM kill。
+    mem_limit: 4g
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
