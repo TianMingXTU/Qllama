@@ -8,25 +8,48 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
+use serde::Deserialize;
 
+/// JSON 配置文件（`--config`）；所有字段可选，CLI 显式参数覆盖同名配置。
+/// 示例见仓库 `config.example.json`。
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    model: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    listen: Option<String>,
+    threads: Option<usize>,
+    ctx_size: Option<usize>,
+    queue_capacity: Option<usize>,
+    request_timeout_secs: Option<u64>,
+    max_request_bytes: Option<usize>,
+    api_key: Option<String>,
+    kv_budget_mib: Option<usize>,
+}
+
+/// CLI 解析到的覆盖值（None = 未在命令行给出，回落到配置文件或内建默认）。
 #[derive(Parser, Debug)]
 #[command(
     name = "qllama-server",
     version,
     about = "OpenAI-compatible HTTP inference server"
 )]
-struct ServerArgs {
+struct CliArgs {
+    /// JSON 配置文件路径；字段为 CLI 参数的子集，CLI 覆盖配置
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     /// GGUF 模型文件路径；只允许 `--model-dir` 白名单目录下的文件
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     /// 模型文件白名单根目录；`--model` 必须位于其中，缺省时用 `--model` 的父目录
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
     /// 监听地址；默认仅本机回环，`0.0.0.0:8080` 才对外
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    listen: String,
+    #[arg(long)]
+    listen: Option<String>,
 
     /// 计算线程数（rayon 池）；默认取逻辑核数
     #[arg(long)]
@@ -37,29 +60,90 @@ struct ServerArgs {
     ctx_size: Option<usize>,
 
     /// 队列容量；排队超过该数的请求收到 429
-    #[arg(long, default_value_t = 32)]
-    queue_capacity: usize,
+    #[arg(long)]
+    queue_capacity: Option<usize>,
 
     /// 单请求总超时（秒）：排队 + 推理 + 流式传输的总预算
-    #[arg(long, default_value_t = 300)]
-    request_timeout_secs: u64,
+    #[arg(long)]
+    request_timeout_secs: Option<u64>,
 
     /// 请求体大小上限（字节）
-    #[arg(long, default_value_t = 1 << 20)]
-    max_request_bytes: usize,
+    #[arg(long)]
+    max_request_bytes: Option<usize>,
 
     /// 可选 API key；设置后所有 /v1 推理请求须带 `Authorization: Bearer <key>`
     #[arg(long)]
     api_key: Option<String>,
 
-    /// KV cache 字节预算（MiB）：单请求估算超过它返回 503，防止大上下文
-    /// 分配拖垮进程；默认 2048 MiB
-    #[arg(long, default_value_t = 2048)]
+    /// KV cache 字节预算（MiB）：单请求估算超过它返回 503
+    #[arg(long)]
+    kv_budget_mib: Option<usize>,
+}
+
+/// 合并后的运行配置（内建默认 ← 配置文件 ← CLI），`run()` 只认这一份。
+#[derive(Debug)]
+struct ServerArgs {
+    #[allow(dead_code)] // 记录来源便于诊断；运行逻辑不读它
+    config: Option<PathBuf>,
+    model: PathBuf,
+    model_dir: Option<PathBuf>,
+    listen: String,
+    threads: Option<usize>,
+    ctx_size: Option<usize>,
+    queue_capacity: usize,
+    request_timeout_secs: u64,
+    max_request_bytes: usize,
+    api_key: Option<String>,
     kv_budget_mib: usize,
 }
 
+/// 合并三层来源：内建默认 ← 配置文件 ← CLI。model 必须由配置或 CLI 给出。
+fn resolve(args: CliArgs) -> Result<ServerArgs, String> {
+    let file = match &args.config {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
+            let config: FileConfig = serde_json::from_str(&text)
+                .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+            config
+        }
+        None => FileConfig::default(),
+    };
+    let model = args.model.or(file.model).ok_or_else(|| {
+        "no model specified: pass --model or set \"model\" in the config file".to_string()
+    })?;
+    Ok(ServerArgs {
+        config: args.config,
+        model,
+        model_dir: args.model_dir.or(file.model_dir),
+        listen: args
+            .listen
+            .unwrap_or_else(|| file.listen.unwrap_or_else(|| "127.0.0.1:8080".into())),
+        threads: args.threads.or(file.threads),
+        ctx_size: args.ctx_size.or(file.ctx_size),
+        queue_capacity: args.queue_capacity.or(file.queue_capacity).unwrap_or(32),
+        request_timeout_secs: args
+            .request_timeout_secs
+            .or(file.request_timeout_secs)
+            .unwrap_or(300),
+        max_request_bytes: args
+            .max_request_bytes
+            .or(file.max_request_bytes)
+            .unwrap_or(1 << 20),
+        api_key: args.api_key.or(file.api_key),
+        kv_budget_mib: args.kv_budget_mib.or(file.kv_budget_mib).unwrap_or(2048),
+    })
+}
+
 fn main() {
-    let args = ServerArgs::parse();
+    let args = match resolve(CliArgs::parse()) {
+        Ok(args) => args,
+        // 参数/配置错误发生在 runtime 之前，直接 stderr + 退出码 1。
+        Err(error) => {
+            eprintln!("qllama-server: {error}");
+            std::process::exit(1);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
