@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use proptest::prelude::*;
 
-use qllama::gguf::{GgufFile, GgufValue};
+use qllama::gguf::GgufFile;
 use qllama::tokenizer::Tokenizer;
 
 /// 最小 GGUF 字节流写入器（与 tests/tokenizer.rs 的 Writer 同构，独立
