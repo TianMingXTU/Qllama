@@ -1201,7 +1201,7 @@ fn spm_empty_prompt_still_adds_bos() {
     assert_eq!(tokenizer.encode("").unwrap(), [0]);
     assert_eq!(
         tokenizer.encode_with_options("", &no_special()).unwrap(),
-        []
+        Vec::<i32>::new()
     );
 }
 
