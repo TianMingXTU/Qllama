@@ -1,7 +1,20 @@
 //! 连续行主序 f32 张量运算。
+//!
+//! `rows == 1` 的密集 GEMV 在运行时检测 x86_64 AVX2 特性；向量路径仍使用
+//! 逐列顺序的 f32 乘、加两条指令，不重排累加也不做乘加收缩，因此可保持与
+//! 标量路径一致的数值结果。未检测到特性或非 x86_64 平台走标量 fallback。
 
 use super::Tensor;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// `--no-single-request-parallel` 关闭 GEMV 列分块，供单请求算子并行 A/B。
+static SINGLE_REQUEST_PARALLEL: AtomicBool = AtomicBool::new(true);
+
+/// 设置单请求算子并行开关；进程启动时调用一次。
+pub fn set_single_request_parallel(enabled: bool) {
+    SINGLE_REQUEST_PARALLEL.store(enabled, Ordering::Relaxed);
+}
 
 /// `rows == 1` 时密集 GEMV 的列分块大小。
 ///
@@ -14,25 +27,60 @@ const GEMV_COL_BLOCK: usize = 64;
 
 /// 计算 `[1, shared] × [shared, columns] -> [1, columns]` 的密集 GEMM。
 ///
-/// 外层按列分块并行；每个线程独占一个列区间，对共享维顺序累加，保证与串行
-/// i-k-j 等价的 IEEE f32 结果。调用方负责持有输出 buffer 的安全写权限。
+/// 外层按列分块并行；每 8 个输出列在 AVX2 可用时共用一次 256 位向量乘加，
+/// 但每个 f32 lane 仍按相同的 `input` 顺序先乘后加。每条 lane 与标量路径
+/// 执行同样的算术序列，因此不改变数值累加语义；特性不可用时逐列计算。
 #[inline]
 fn matmul_row_parallel(out: &mut [f32], input: &[f32], other: &[f32], columns: usize) {
-    let rows = other.chunks_exact(columns);
-    for start in (0..columns).step_by(GEMV_COL_BLOCK) {
-        let end = (start + GEMV_COL_BLOCK).min(columns);
-        // 闭包捕获不可 Send 的值时显式 move；par_iter_mut 会校验 Send。
+    let block = if SINGLE_REQUEST_PARALLEL.load(Ordering::Relaxed) {
+        GEMV_COL_BLOCK
+    } else {
+        1
+    };
+    for start in (0..columns).step_by(block) {
+        let end = (start + block).min(columns);
         let mut buf = vec![0.0f32; end - start];
-        buf.par_iter_mut().enumerate().for_each(|(offset, acc)| {
-            let col = start + offset;
-            let mut s = 0.0;
-            for (left, right_row) in input.iter().zip(rows.clone()) {
-                s += left * right_row[col];
+        buf.par_chunks_mut(8).enumerate().for_each(|(lane, acc)| {
+            let col = start + lane * 8;
+            #[cfg(target_arch = "x86_64")]
+            {
+                // 运行时检测确保只在支持 AVX2 的 CPU 上进入 intrinsic；acc 的
+                // 长度与 other 的列数均由前面的形状校验和分块逻辑保证。
+                if acc.len() == 8 && is_x86_feature_detected!("avx2") {
+                    unsafe { dot_into_8_avx2(acc, col, input, other, columns) };
+                    return;
+                }
             }
-            *acc = s;
+            for (offset, value) in acc.iter_mut().enumerate() {
+                let mut s = 0.0f32;
+                for (k, &left) in input.iter().enumerate() {
+                    s += left * other[k * columns + col + offset];
+                }
+                *value += s;
+            }
         });
         out[start..end].copy_from_slice(&buf);
     }
+}
+
+/// AVX2 的 8 列点积；逐 lane 使用分离乘、加，避免 FMA 改变 f32 舍入结果。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_into_8_avx2(
+    acc: &mut [f32],
+    col: usize,
+    input: &[f32],
+    other: &[f32],
+    columns: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let mut sum = _mm256_loadu_ps(acc.as_ptr());
+    for (k, &left) in input.iter().enumerate() {
+        let right = _mm256_loadu_ps(other.as_ptr().add(k * columns + col));
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(_mm256_set1_ps(left), right));
+    }
+    _mm256_storeu_ps(acc.as_mut_ptr(), sum);
 }
 
 /// 张量算子；结果不修改输入或其共享视图。

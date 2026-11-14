@@ -1,24 +1,39 @@
 //! OpenAI 兼容 HTTP 推理服务层。
 //!
 //! 结构对应 ADR 0001：Engine（模型，只读共享）/ Session（每请求 KV + 采样状态）
-//! / Scheduler（单线程队列 + 串行推理）。线程模型对应 ADR 0002：tokio 只做
-//! HTTP 与超时，推理在调度器自己的 OS 线程里同步执行，结果经 channel 送回。
+//! / Scheduler（请求队列与 decode step 调度）。线程模型：tokio 负责 HTTP 与
+//! 超时，模型前同步执行，结果经 channel 送回。
 //!
-//! 诚实性约定（红线）：本引擎是**串行逐请求**执行——调度器一次只跑一个
-//! 请求的 decode 循环，其余请求在 FIFO 队列里等待。这是排队，不是 batching；
-//! 文档与指标里不得声称 batch/parallel inference。
+//! 调度器支持两种模式：`--no-cont-batching` 保留逐请求串行基线；默认模式在
+//! 每个 decode step 用 rayon 并行推进已就绪的独立前向。每个请求拥有独立
+//! KV lease，不把不同 prompt 拼成一个融合张量。
 //!
 //! 取消语义：HTTP 侧断连/超时放弃时事件 Receiver 被 drop 且取消标志置位，
 //! 调度器在下一个 decode step 停止生成，KV 随 session 释放。
 
+pub mod adapters;
 pub mod api;
+pub mod audit;
+pub mod auth;
+pub mod capabilities;
+pub mod extensions;
+pub mod metrics;
+pub mod ollama;
+pub mod qos;
+pub mod registry;
+pub mod schema;
+pub mod template;
+pub mod tools;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use serde_json::{json, Value};
+
+use crate::kv_cache::pool::KvPool;
 use crate::kv_cache::KvCache;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
@@ -30,6 +45,8 @@ pub struct ApiError {
     pub status: u16,
     pub kind: &'static str,
     pub message: String,
+    /// 请求中显式拒绝的字段/能力；错误体写入 `error.qllama.unsupported`。
+    pub unsupported: Vec<String>,
 }
 
 impl ApiError {
@@ -38,6 +55,7 @@ impl ApiError {
             status: 400,
             kind: "invalid_request_error",
             message: message.into(),
+            unsupported: Vec::new(),
         }
     }
     pub fn not_found(message: impl Into<String>) -> Self {
@@ -45,6 +63,7 @@ impl ApiError {
             status: 404,
             kind: "invalid_request_error",
             message: message.into(),
+            unsupported: Vec::new(),
         }
     }
     pub fn queue_full() -> Self {
@@ -52,6 +71,7 @@ impl ApiError {
             status: 429,
             kind: "rate_limit_error",
             message: "queue is full; retry later".into(),
+            unsupported: Vec::new(),
         }
     }
     pub fn overloaded(message: impl Into<String>) -> Self {
@@ -59,6 +79,7 @@ impl ApiError {
             status: 503,
             kind: "service_unavailable",
             message: message.into(),
+            unsupported: Vec::new(),
         }
     }
     pub fn internal(message: impl Into<String>) -> Self {
@@ -66,7 +87,20 @@ impl ApiError {
             status: 500,
             kind: "internal_error",
             message: message.into(),
+            unsupported: Vec::new(),
         }
+    }
+
+    /// 附加不支持字段清单；错误响应会写入 `error.qllama.unsupported`。
+    pub fn with_unsupported(mut self, items: Vec<&'static str>) -> Self {
+        self.unsupported = items.into_iter().map(str::to_string).collect();
+        self
+    }
+
+    /// 附加配额/背压拒绝原因，供指标标签使用。
+    pub fn with_rejection(mut self, reason: &str) -> Self {
+        self.message = format!("{} ({reason})", self.message);
+        self
     }
 }
 
@@ -78,6 +112,8 @@ pub struct Engine {
     pub ctx_size: usize,
     /// `--model-dir` 白名单根目录，启动时路径校验用
     pub model_dir: PathBuf,
+    /// 启动时加载的模型文件路径；registry digest 与能力发现使用。
+    pub model_path: PathBuf,
     pub model_name: String,
     /// 推理用 rayon 池；decode 的 matmul 在这里并行
     pub pool: rayon::ThreadPool,
@@ -155,6 +191,7 @@ impl Engine {
             tokenizer,
             ctx_size,
             model_dir: canonical_dir,
+            model_path: canonical_model,
             model_name,
             pool,
         }))
@@ -162,7 +199,7 @@ impl Engine {
 
     /// 每 token 的 KV cache 字节数：K/V 两份 × f32 × num_layers × num_kv_heads
     /// × head_dim。
-    fn kv_bytes_per_token(&self) -> usize {
+    pub fn kv_bytes_per_token(&self) -> usize {
         let config = self.model.config();
         config.num_layers * config.num_kv_heads * config.head_dim() * 2 * std::mem::size_of::<f32>()
     }
@@ -197,6 +234,8 @@ pub struct GenerationRequest {
     pub seed: Option<u64>,
     /// 最多 4 条 stop 序列（在解码后的累计文本上做前缀截断）
     pub stop_texts: Vec<String>,
+    /// 可选结构化输出约束；`Debug` 供调度线程持有，生成循环据此 mask logits。
+    pub schema: Option<crate::server::schema::JsonSchema>,
 }
 
 /// 会话级失败原因；`api.rs` 按变体映射 HTTP 状态码。
@@ -225,6 +264,7 @@ pub enum SessionEvent {
         reason: &'static str,
         ttft: Duration,
         total: Duration,
+        cache_hit: bool,
     },
     /// 致命错误：session 终止
     Failed(Failure),
@@ -253,10 +293,64 @@ pub struct Limits {
     pub kv_byte_budget: usize,
 }
 
-/// Scheduler：单线程 FIFO 队列 + 串行执行。
+/// 启动时冻结的运行时选项；`/v1/capabilities` 与可复现合同直接暴露。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RuntimeOptions {
+    pub public_health: bool,
+    pub public_metrics: bool,
+    pub cors_origins: Vec<String>,
+    pub oidc_enabled: bool,
+    pub continuous_batching: bool,
+    pub single_request_parallel: bool,
+    pub prefix_cache: bool,
+    pub kv_block_size: usize,
+    pub audit_log: Option<PathBuf>,
+    pub api_key_file: Option<PathBuf>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            public_health: true,
+            public_metrics: true,
+            cors_origins: Vec::new(),
+            oidc_enabled: false,
+            continuous_batching: true,
+            single_request_parallel: true,
+            prefix_cache: false,
+            kv_block_size: 32,
+            audit_log: None,
+            api_key_file: None,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+/// 鉴权、QoS 与可复现配置的可变覆盖层；三参数 `start` 保留兼容默认值。
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeConfig {
+    pub auth: auth::AuthConfig,
+    pub options: RuntimeOptions,
+    pub default_quota: qos::Quota,
+    pub per_key_quota: std::collections::HashMap<String, qos::Quota>,
+    pub key_file_reload: bool,
+}
+
+/// 可在同一 decode step 并行调用的生成 worker；只持有共享模型与 KV 池，
+/// 不持有 `mpsc::Receiver`，因此满足 `Send + Sync`。
+#[derive(Clone)]
+struct GenerationWorker {
+    engine: Arc<Engine>,
+    kv_pool: Arc<KvPool>,
+}
+
+/// Scheduler：请求队列与 decode step 调度。
 ///
-/// 组批窗口（攒批 decode）在本引擎上没有意义：一次只有一个请求在 decode，
-/// 其余在排队，"批"里永远只有一个。这是排队不是 batching，如实记录。
+/// 默认模式把已就绪 session 组批，每个 step 并行执行各 session 的独立前向；
+/// `--no-cont-batching` 保持逐请求串行，用于 A/B 与回归。
 pub struct Scheduler {
     engine: Arc<Engine>,
     receiver: mpsc::Receiver<Session>,
@@ -264,6 +358,8 @@ pub struct Scheduler {
     limits: Limits,
     /// 当前排队请求数（不含正在执行的），api 层背压检查与 /metrics 共用
     queue_depth: Arc<AtomicUsize>,
+    kv_pool: Arc<KvPool>,
+    cont_batching_enabled: Arc<AtomicBool>,
 }
 
 impl Scheduler {
@@ -272,6 +368,8 @@ impl Scheduler {
         receiver: mpsc::Receiver<Session>,
         limits: Limits,
         queue_depth: Arc<AtomicUsize>,
+        kv_pool: Arc<KvPool>,
+        cont_batching_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             engine,
@@ -279,6 +377,8 @@ impl Scheduler {
             queue: VecDeque::new(),
             limits,
             queue_depth,
+            kv_pool,
+            cont_batching_enabled,
         }
     }
 
@@ -314,50 +414,74 @@ impl Scheduler {
         }
     }
 
-    /// 执行队列中所有请求（FIFO）。
+    /// 执行队列中所有请求。默认按 decode step 组批；`--no-cont-batching`
+    /// 走逐个执行的串行基线。
     fn run_queued(&mut self) {
-        while let Some(session) = self.queue.pop_front() {
-            self.queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
-            if session.cancelled.load(AtomicOrdering::Relaxed) {
-                continue;
+        if !self.cont_batching_enabled.load(AtomicOrdering::Relaxed) || self.queue.len() < 2 {
+            while let Some(session) = self.queue.pop_front() {
+                self.queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+                if !session.cancelled.load(AtomicOrdering::Relaxed) {
+                    self.execute(session);
+                }
             }
-            self.execute(session);
+            return;
         }
+        let drained_len = self.queue.len();
+        let batch: Vec<Session> = std::mem::take(&mut self.queue)
+            .into_iter()
+            .filter(|session| !session.cancelled.load(AtomicOrdering::Relaxed))
+            .collect();
+        self.queue_depth
+            .fetch_sub(drained_len, AtomicOrdering::Relaxed);
+        if batch.is_empty() {
+            return;
+        }
+        let worker = GenerationWorker {
+            engine: Arc::clone(&self.engine),
+            kv_pool: Arc::clone(&self.kv_pool),
+        };
+        self.engine.pool.scope(|scope| {
+            for session in batch {
+                let worker = worker.clone();
+                scope.spawn(move |_| worker.execute(session));
+            }
+        });
     }
 
-    /// 执行单个请求的完整生成循环。
-    ///
-    /// 资源保护：先按模型形状估算 KV 字节数，超预算直接 503，不做分配
-    /// （分配失败在 Rust 里是 abort，拦不住，必须在分配前拒绝）。
     fn execute(&mut self, session: Session) {
+        let worker = GenerationWorker {
+            engine: Arc::clone(&self.engine),
+            kv_pool: Arc::clone(&self.kv_pool),
+        };
+        worker.execute(session);
+    }
+}
+
+impl GenerationWorker {
+    /// 分配 KV lease，然后执行单个请求的完整生成循环。
+    ///
+    /// 资源保护在 `KvPool::acquire` 内完成：按固定 block 对齐容量并做全局
+    /// 字节预算检查，失败直接 503；lease 在取消、完成和错误路径均自动归还。
+    fn execute(&self, session: Session) {
         let capacity = session
             .request
             .prompt_ids
             .len()
             .saturating_add(session.request.max_tokens)
             .min(self.engine.ctx_size);
-        let estimated = capacity.saturating_mul(self.engine.kv_bytes_per_token());
-        if estimated > self.limits.kv_byte_budget {
-            let _ = session
-                .events
-                .send(SessionEvent::Failed(Failure::Overloaded(format!(
-                    "request needs ~{} MiB of KV cache, exceeding server budget {} MiB",
-                    estimated / (1024 * 1024),
-                    self.limits.kv_byte_budget / (1024 * 1024)
-                ))));
-            return;
-        }
-        let kv = match self.engine.new_kv_cache(capacity) {
-            Ok(kv) => kv,
+        let mut kv = match self.kv_pool.acquire(capacity) {
+            Ok(lease) => lease,
             Err(message) => {
                 let _ = session
                     .events
-                    .send(SessionEvent::Failed(Failure::Overloaded(message)));
+                    .send(SessionEvent::Failed(Failure::Overloaded(format!(
+                        "KV pool allocation failed: {message}"
+                    ))));
                 return;
             }
         };
         let started = Instant::now();
-        if let Err(message) = self.run_generation(&session, kv, capacity, started) {
+        if let Err(message) = self.run_generation(&session, &mut kv, capacity, started) {
             let _ = session
                 .events
                 .send(SessionEvent::Failed(Failure::Internal(message)));
@@ -373,7 +497,7 @@ impl Scheduler {
     fn run_generation(
         &self,
         session: &Session,
-        mut kv: KvCache,
+        kv: &mut KvCache,
         capacity: usize,
         started: Instant,
     ) -> Result<(), String> {
@@ -399,6 +523,11 @@ impl Scheduler {
         // 为可能的 stop 序列跨 token 匹配保留的尾部字节数：
         // 任何 stop 都可能差 1 字节才完整，所以最后 (最长stop-1) 字节
         // 在确认前不发。数学保证 stop 匹配位置不会落在已发送区域内。
+        let mut json_state = session
+            .request
+            .schema
+            .as_ref()
+            .map(|_| crate::server::schema::JsonState::new());
         let holdback = session
             .request
             .stop_texts
@@ -419,14 +548,47 @@ impl Scheduler {
                 break; // 上下文用尽，按 "length" 结束
             }
 
-            let logits = pool.install(|| model.forward_with_cache(&batch, position, &mut kv))?;
+            let logits = pool.install(|| model.forward_with_cache(&batch, position, kv))?;
             let vocab = logits.dims()[1];
             let last_start = (logits.dims()[0] - 1) * vocab;
             let row = logits
                 .data()
                 .get(last_start..last_start + vocab)
                 .ok_or_else(|| "logits buffer shorter than shape".to_string())?;
+            let mut masked;
+            let row = if let Some(state) = json_state.as_ref() {
+                masked = row.to_vec();
+                let tokenizer = self.engine.tokenizer.as_ref();
+                crate::server::schema::apply_mask(
+                    &mut masked,
+                    state,
+                    session.request.schema.as_ref(),
+                    |id| {
+                        let token_id = i32::try_from(id).ok()?;
+                        tokenizer
+                            .and_then(|tokenizer| tokenizer.token_text(token_id))
+                            .map(str::to_string)
+                    },
+                );
+                masked.as_slice()
+            } else {
+                row
+            };
             let next = sampler.sample_slice(row, &ids)?;
+            if let Some(state) = json_state.as_mut() {
+                let next_text = self
+                    .engine
+                    .tokenizer
+                    .as_ref()
+                    .and_then(|tokenizer| tokenizer.token_text(next))
+                    .unwrap_or("");
+                if let Err(message) = state.push_token(next_text) {
+                    let _ = session
+                        .events
+                        .send(SessionEvent::Failed(Failure::Internal(message)));
+                    return Ok(());
+                }
+            }
             position += batch.len();
             batch.clear();
 
@@ -493,6 +655,47 @@ impl Scheduler {
             if safe_len > emitted {
                 emitted = safe_len;
             }
+            if json_state.as_ref().is_some_and(|state| state.is_complete()) {
+                let piece_sent = decoded[..emitted].to_string();
+                let value = json_state.as_mut().and_then(|state| state.finish().ok());
+                if let Some(ref schema) = session.request.schema {
+                    if value
+                        .as_ref()
+                        .and_then(|value| {
+                            crate::server::schema::validate_json_object(schema, value).err()
+                        })
+                        .is_some()
+                    {
+                        let _ = session.events.send(SessionEvent::Failed(Failure::Internal(
+                            "constrained JSON output violated schema".into(),
+                        )));
+                        return Ok(());
+                    }
+                }
+                if piece_sent != decoded {
+                    let _ = session.events.send(SessionEvent::Delta(piece_sent));
+                }
+                self.finish(
+                    session,
+                    &decoded,
+                    emitted,
+                    generated,
+                    "stop",
+                    GenerationTiming { ttft, started },
+                );
+                return Ok(());
+            }
+        }
+        // 上下文/token 预算耗尽时结构化输出仍未完成：宁可显式失败，
+        // 也不返回不可解析的垃圾文本（诚实降级）。
+        if json_state
+            .as_ref()
+            .is_some_and(|state| !state.is_complete())
+        {
+            let _ = session.events.send(SessionEvent::Failed(Failure::Internal(
+                "constrained JSON output did not complete within max_tokens".into(),
+            )));
+            return Ok(());
         }
         self.finish(
             session,
@@ -505,9 +708,6 @@ impl Scheduler {
         Ok(())
     }
 
-    /// 结束会话：把剩余未发送文本冲出去，再发 Done。
-    ///
-    /// `emitted` 是已发送字节偏移；本函数总是生成循环的收尾步（调用后即
     /// 结束会话：把剩余未发送文本冲出去，再发 Done。
     ///
     /// `emitted` 是已发送字节偏移；本函数总是生成循环的收尾步（调用后即
@@ -531,6 +731,7 @@ impl Scheduler {
             reason,
             ttft: timing.ttft.unwrap_or_else(|| timing.started.elapsed()),
             total: timing.started.elapsed(),
+            cache_hit: false,
         });
     }
 }
@@ -541,62 +742,215 @@ struct GenerationTiming {
     started: Instant,
 }
 
-/// 进程级指标计数器（/metrics 渲染用）。queue_depth 由 Scheduler 与
-/// ServerState 共享，见 `ServerState::start`。
-pub struct Metrics {
-    pub requests_total: AtomicU64,
-    pub tokens_generated: AtomicU64,
-}
-
-impl Metrics {
-    fn new() -> Self {
-        Self {
-            requests_total: AtomicU64::new(0),
-            tokens_generated: AtomicU64::new(0),
-        }
-    }
-}
-
 /// 服务端共享状态：axum State。
 pub struct ServerState {
     pub engine: Arc<Engine>,
     pub submit: mpsc::Sender<Session>,
     pub limits: Limits,
+    /// 兼容旧调用方：配置单个 secret 时使用；多 key 路径用 `auth_config`。
     pub api_key: Option<String>,
-    pub metrics: Arc<Metrics>,
-    /// 当前排队请求数，与 Scheduler 共享（背压检查 + /metrics）
+    pub metrics: Arc<metrics::Metrics>,
     pub queue_depth: Arc<AtomicUsize>,
-    /// 启动时刻，用于 uptime 指标
     pub started: Instant,
+    auth_config: Arc<RwLock<auth::AuthConfig>>,
+    options: RuntimeOptions,
+    audit_log: Arc<audit::AuditLog>,
+    qos: Arc<qos::QosManager>,
+    registry: Arc<RwLock<registry::ModelRegistry>>,
+    kv_pool: Arc<KvPool>,
+    model_digest: String,
+    config_snapshot: Value,
+    cont_batching_enabled: Arc<AtomicBool>,
 }
 
 impl ServerState {
-    /// 装配服务状态并启动调度线程。返回的 JoinHandle 供进程退出前
-    /// 等待排空完成。
+    /// 装配服务状态并启动调度线程。保留三参数签名供既有集成测试使用。
     pub fn start(
         engine: Arc<Engine>,
         limits: Limits,
         api_key: Option<String>,
     ) -> Result<(Arc<Self>, std::thread::JoinHandle<()>), String> {
+        let mut runtime = RuntimeConfig::default();
+        if let Some(secret) = &api_key {
+            runtime.auth.keys.push(auth::ApiKey {
+                id: "primary".into(),
+                secret: secret.clone(),
+                role: auth::Role::Admin,
+                tenant: "default".into(),
+                revoked: false,
+                expires_at: None,
+            });
+        }
+        Self::start_with_runtime(engine, limits, api_key, runtime)
+    }
+
+    /// 装配带多 key、QoS、审计、registry 与可复现快照的服务状态。
+    pub fn start_with_runtime(
+        engine: Arc<Engine>,
+        limits: Limits,
+        api_key: Option<String>,
+        runtime: RuntimeConfig,
+    ) -> Result<(Arc<Self>, std::thread::JoinHandle<()>), String> {
         let (submit, receiver) = mpsc::channel::<Session>();
         let queue_depth = Arc::new(AtomicUsize::new(0));
-        let scheduler = Scheduler::new(engine.clone(), receiver, limits, queue_depth.clone());
+        let cont_batching_enabled = Arc::new(AtomicBool::new(runtime.options.continuous_batching));
+        let mut kv_pool = KvPool::new(
+            engine.model.config(),
+            runtime.options.kv_block_size.max(1),
+            limits.kv_byte_budget.max(1),
+        );
+        kv_pool.enable_prefix_cache(runtime.options.prefix_cache);
+        let kv_pool = Arc::new(kv_pool);
+        let scheduler = Scheduler::new(
+            engine.clone(),
+            receiver,
+            limits,
+            queue_depth.clone(),
+            kv_pool.clone(),
+            cont_batching_enabled.clone(),
+        );
         let handle = std::thread::Builder::new()
             .name("qllama-scheduler".into())
             .spawn(move || scheduler.run())
             .map_err(|e| format!("cannot spawn scheduler thread: {e}"))?;
-        Ok((
-            Arc::new(Self {
-                engine,
-                submit,
-                limits,
-                api_key,
-                metrics: Arc::new(Metrics::new()),
-                queue_depth,
-                started: Instant::now(),
-            }),
-            handle,
-        ))
+        let registry = registry::ModelRegistry::new(&engine.model_dir)
+            .map_err(|e| format!("cannot initialize model registry: {e}"))?;
+        let model_digest = registry
+            .list()
+            .iter()
+            .find(|entry| entry.path == engine.model_path)
+            .map(|entry| entry.digest.clone())
+            .or_else(|| registry::compute_file_digest(&engine.model_path).ok())
+            .unwrap_or_else(|| "unavailable".into());
+        let config_snapshot = json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "listen_default": "127.0.0.1:8080",
+            "threads": engine.pool.current_num_threads(),
+            "ctx_size": engine.ctx_size,
+            "limits": {
+                "queue_capacity": limits.queue_capacity,
+                "request_timeout_secs": limits.request_timeout.as_secs(),
+                "max_request_bytes": limits.max_request_bytes,
+                "kv_budget_mib": limits.kv_byte_budget / (1024 * 1024),
+            },
+            "runtime": runtime.options,
+        });
+        let state = Self {
+            engine,
+            submit,
+            limits,
+            api_key,
+            metrics: Arc::new(metrics::Metrics::new()),
+            queue_depth,
+            started: Instant::now(),
+            auth_config: Arc::new(RwLock::new(runtime.auth)),
+            options: runtime.options.clone(),
+            audit_log: Arc::new(audit::AuditLog::new(runtime.options.audit_log.as_deref())),
+            qos: Arc::new(qos::QosManager::new(
+                runtime.default_quota,
+                runtime.per_key_quota,
+            )),
+            registry: Arc::new(RwLock::new(registry)),
+            kv_pool,
+            model_digest,
+            config_snapshot,
+            cont_batching_enabled,
+        };
+        state.metrics.set_last_request_id("startup");
+        Ok((Arc::new(state), handle))
+    }
+
+    /// 返回当前鉴权配置快照（明确重载语义：仅启动时加载或显式调用 `reload_keys`）。
+    pub fn auth_config(&self) -> auth::AuthConfig {
+        self.auth_config
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// 启动时加载/替换密钥；轮换语义是进程内显式调用，不监听文件变化。
+    pub fn reload_keys(&self, keys: Vec<auth::ApiKey>) {
+        if let Ok(mut guard) = self.auth_config.write() {
+            guard.keys = keys;
+        }
+    }
+
+    pub fn runtime_options(&self) -> RuntimeOptions {
+        self.options.clone()
+    }
+
+    pub fn audit_log(&self) -> Arc<audit::AuditLog> {
+        Arc::clone(&self.audit_log)
+    }
+
+    pub fn qos(&self) -> Arc<qos::QosManager> {
+        Arc::clone(&self.qos)
+    }
+
+    pub fn registry_snapshot(&self) -> Vec<registry::ModelEntry> {
+        self.registry
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .list()
+    }
+
+    pub fn load_model(&self, id: &str) -> Result<registry::ModelEntry, String> {
+        let mut registry = self
+            .registry
+            .write()
+            .map_err(|_| "model_registry_lock_poisoned".to_string())?;
+        let entry = registry.resolve(id)?;
+        registry.mark_loaded(&entry.id)?;
+        Ok(entry)
+    }
+
+    pub fn unload_model(&self, id: &str) -> Result<(), String> {
+        let mut registry = self
+            .registry
+            .write()
+            .map_err(|_| "model_registry_lock_poisoned".to_string())?;
+        registry.unload(id)
+    }
+
+    pub fn kv_pool(&self) -> Arc<KvPool> {
+        Arc::clone(&self.kv_pool)
+    }
+
+    pub fn model_digest(&self) -> String {
+        self.model_digest.clone()
+    }
+
+    pub fn capability_snapshot(&self) -> Value {
+        let tokenizer = self.engine.tokenizer.as_ref();
+        let custom_template = tokenizer.and_then(|t| t.chat_template()).is_some();
+        capabilities::capability_document(&capabilities::CapabilitySnapshot {
+            version: env!("CARGO_PKG_VERSION"),
+            model_digest: self.model_digest(),
+            quantization: "F32/F16/Q4_0/Q8_0".into(),
+            kv_dtype: "f32",
+            chat_template: if custom_template {
+                "gguf:tokenizer.chat_template".into()
+            } else {
+                "chatml".into()
+            },
+            template_fallback: (!custom_template).then_some("chatml"),
+            concurrency_mode: "continuous_batching:independent_forward",
+            continuous_batching: self.cont_batching_enabled.load(AtomicOrdering::Relaxed),
+            single_request_parallel: self.options.single_request_parallel,
+            prefix_cache: self.options.prefix_cache,
+            config_snapshot: self.config_snapshot.clone(),
+        })
+    }
+
+    pub fn active_sessions(&self) -> usize {
+        self.kv_pool.stats().active_leases
+    }
+
+    pub fn loaded_models(&self) -> usize {
+        self.registry
+            .read()
+            .map(|registry| registry.loaded_count())
+            .unwrap_or(1)
     }
 }
 
@@ -604,7 +958,7 @@ impl ServerState {
 /// 新连接且在途请求处理完毕；此后 `ServerState` 的全部引用随调用方释放，
 /// submit 通道关闭，调度线程排空后退出（由调用方 join）。
 pub async fn serve(state: Arc<ServerState>, listen: std::net::SocketAddr) -> anyhow::Result<()> {
-    let app = api::router(state);
+    let app = extensions::router_with_extensions(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("qllama-server listening on {listen}");
     axum::serve(listener, app)

@@ -1,35 +1,44 @@
-# systemd 单元（Linux 裸机部署）。
-# 安装：cp deploy/qllama.service /etc/systemd/system/
-#       用户/路径按现场调整后 systemctl daemon-reload && systemctl enable --now qllama
 [Unit]
-Description=Qllama OpenAI-compatible inference server
+Description=Qllama CPU-only text-generation inference server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+# 非 root 用户；与 Dockerfile/compose 的 qllama (uid 1001) 假设一致。
 User=qllama
 Group=qllama
-# 默认仅回环；对外暴露必须加 --api-key 并改 --listen
-ExecStart=/usr/local/bin/qllama-server --model /var/lib/qllama/model.gguf --listen 127.0.0.1:8080
-# SIGTERM → 停止接收 → 排空在途请求（qllama-server 内建；超时上限 = request-timeout-secs）
-KillSignal=SIGTERM
-TimeoutStopSec=300
-Restart=on-failure
-RestartSec=5
 
-# 加固：只给模型目录写权限之外的只读视图
-NoNewPrivileges=true
+# 进程只监听回环；生产经反向代理终止 TLS。
+ExecStart=/usr/local/bin/qllama-server \
+  --models-dir /var/lib/qllama/models \
+  --model /var/lib/qllama/model.gguf \
+  --listen 127.0.0.1:8080 \
+  --kv-block-size 32 \
+  --cont-batching \
+  --audit-log /var/log/qllama/audit.jsonl \
+  --api-key-file /etc/qllama/api_keys.txt
+
+# 线程数可由环境覆盖；不强制。
+Environment=QLLAMA_THREADS=8
+Environment=RUST_LOG=info
+
+# 只读系统根；仅审计日志目录可写（审计目录需提前建好并 chown qllama）。
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/qllama
-PrivateTmp=true
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
+ReadWritePaths=/var/log/qllama
+# 审计目录创建示例（运维侧执行）：
+#   install -d -o qllama -g qllama -m 0755 /var/log/qllama
+#   install -d -o qllama -g qllama -m 0750 /etc/qllama
+#   install -m 0640 /path/to/api_keys.txt /etc/qllama/api_keys.txt
 
-# 内存上限与 --kv-budget-mib 同向调整：权重 + KV + HTTP 缓冲
+NoNewPrivileges=true
+PrivateTmp=true
+# 内存上限按模型与 kv_budget_mib 调整。
 MemoryMax=8G
+
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

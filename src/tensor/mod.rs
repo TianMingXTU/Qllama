@@ -4,4 +4,4 @@ mod data;
 mod ops;
 
 pub use data::Tensor;
-pub use ops::TensorOps;
+pub use ops::{set_single_request_parallel, TensorOps};

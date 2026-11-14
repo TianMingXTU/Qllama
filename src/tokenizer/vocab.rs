@@ -76,6 +76,7 @@ pub struct Tokenizer {
     unk_id: Option<i32>,
     /// 是否在文本首部补空格（SPM 语义，llama.cpp 的 add_space_prefix）。
     add_space_prefix: bool,
+    chat_template: Option<String>,
 }
 
 impl Tokenizer {
@@ -252,6 +253,13 @@ impl Tokenizer {
                 ));
             }
         }
+        let chat_template = match gguf.metadata.get("tokenizer.chat_template") {
+            None => None,
+            Some(GgufValue::String(template)) => Some(template.clone()),
+            Some(_) => {
+                return Err("Metadata key tokenizer.chat_template must be a string".to_string())
+            }
+        };
         Ok(Self {
             model,
             token_to_id,
@@ -262,6 +270,7 @@ impl Tokenizer {
             eos_id,
             unk_id,
             add_space_prefix,
+            chat_template,
         })
     }
 
@@ -278,6 +287,19 @@ impl Tokenizer {
     /// 词表大小。
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
+    }
+
+    /// GGUF 附带的 Jinja 子集对话模板；缺失时由上层显式回退 ChatML。
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
+
+    /// 特殊 token 的字面文本，供模板中的 bos/eos 变量渲染使用。
+    pub fn token_text(&self, id: i32) -> Option<&str> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.id_to_token.get(index))
+            .map(String::as_str)
     }
 
     /// 编码文本；默认行为（加 BOS、不加 EOS）与 llama.cpp 的

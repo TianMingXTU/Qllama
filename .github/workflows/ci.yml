@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main, feat/**]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux:
+    name: Linux (fmt, clippy, test, build, docker, conformance)
+    runs-on: ubuntu-latest
+    services:
+      # 本地不依赖外部 Docker registry 凭据；docker build 仅用上下文，无 secrets。
+      docker:
+        image: docker:24-dind
+        options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rc-ci
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test (all features)
+        run: cargo test --all-features
+
+      - name: Build release server (locked)
+        run: cargo build --locked --release --features server --bin qllama-server
+
+      - name: Build release server
+        run: cargo build --release --features server --bin qllama-server
+
+      - name: Docker build
+        run: docker build -t qllama:rc .
+
+      - name: Conformance smoke (start server)
+        run: |
+          mkdir -p target/reports
+          ./target/release/qllama-server \
+            --model tests/fixtures/tiny-llama.gguf \
+            --listen 127.0.0.1:8080 \
+            --ctx-size 512 \
+            --kv-block-size 32 \
+            --cont-batching \
+            --audit-log target/reports/audit.jsonl \
+            > target/reports/server.stdout.log 2>&1 &
+          echo $! > target/reports/server.pid
+        # 注意：不写死 .exe；Windows 本地由用户用等价命令启动。
+
+      - name: Wait for /healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "server healthy after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/healthz || (echo "server did not become healthy"; cat target/reports/server.stdout.log; exit 1)
+
+      - name: Conformance smoke (OpenAI client, stdlib only)
+        # tiny 夹具词表不含 JSON 结构字符，json_object/json_schema 在该词表下
+        # 无法生成合法 JSON，会触发请求边界 400；这两项在 nightly 用真实模型跑全量。
+        run: python scripts/conformance_openai.py --base-url http://127.0.0.1:8080 --skip response_format_json_object,response_format_json_schema
+
+      - name: Stop server (always)
+        if: always()
+        run: |
+          if [ -f target/reports/server.pid ]; then
+            kill "$(cat target/reports/server.pid)" 2>/dev/null || true
+            wait "$(cat target/reports/server.pid)" 2>/dev/null || true
+          fi
+          pkill -f 'qllama-server' 2>/dev/null || true

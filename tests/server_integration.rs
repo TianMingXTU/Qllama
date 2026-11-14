@@ -442,6 +442,178 @@ fn api_key_required() {
     assert_eq!(status, 200, "valid api key should be 200");
 }
 
+/// 以额外命令行参数启动服务器（模型缺失时返回 None 跳过）。
+fn start_server_with_args(extra: &[&str]) -> Option<Server> {
+    let model = model_path()?;
+    let port = free_port();
+    let bin = env!("CARGO_BIN_EXE_qllama-server");
+    let mut command = Command::new(bin);
+    command.args([
+        "--model",
+        &model,
+        "--listen",
+        &format!("127.0.0.1:{port}"),
+        "--request-timeout-secs",
+        "60",
+    ]);
+    command.args(extra);
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn qllama-server");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+            if s.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .is_ok()
+            {
+                let mut buf = String::new();
+                let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = s.read_to_string(&mut buf);
+                if buf.contains("200") && buf.contains("ok") {
+                    let guard = TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+                    return Some(Server {
+                        child,
+                        port,
+                        _lock: guard,
+                    });
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// 发送原始 HTTP 请求文本并返回 (状态码, 含头与体的完整响应文本)。
+/// 与 read_response 不同，本函数保留响应头（CORS 断言需要检查头部）。
+fn raw_request(port: u16, request: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("set timeout");
+    stream.write_all(request.as_bytes()).expect("write request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+/// RBAC（任务书 K.2）：Read 角色密钥请求推理端点必须 403（已认证但越权），
+/// 管理端点同样 403；Inference 密钥推理应 200。
+#[test]
+fn rbac_read_key_gets_403_not_401() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("keys.json");
+    std::fs::write(
+        &config_path,
+        r#"{"api_keys":[
+            {"id":"admin","secret":"it-admin-secret","role":"admin","tenant":"t-admin"},
+            {"id":"infer","secret":"it-infer-secret","role":"inference","tenant":"t-infer"},
+            {"id":"reader","secret":"it-read-secret","role":"read","tenant":"t-read"}
+        ]}"#,
+    )
+    .expect("write config");
+    let Some(server) = start_server_with_args(&["--config", config_path.to_str().unwrap()]) else {
+        eprintln!("skipping: no test model available");
+        return;
+    };
+    let port = server.port;
+
+    let infer_body = |key: &str| -> (u16, String) {
+        let body = "{\"prompt\":\"hi\",\"max_tokens\":4}";
+        raw_request(
+                port,
+                &format!(
+                    "POST /v1/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {key}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+    };
+
+    // Inference 密钥：200。
+    let (status, _) = infer_body("it-infer-secret");
+    assert_eq!(status, 200, "inference key should pass inference endpoint");
+    // Read 密钥请求推理：403 而非 401。
+    let (status, body) = infer_body("it-read-secret");
+    assert_eq!(status, 403, "read key on inference endpoint should be 403");
+    assert!(
+        body.contains("permission_error"),
+        "403 body should say permission_error: {body}"
+    );
+    // Read 密钥请求管理端点：403。
+    let body = "{\"model\":\"default\"}";
+    let (status, _) = raw_request(
+        port,
+        &format!(
+            "POST /models/unload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer it-read-secret\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert_eq!(status, 403, "read key on admin endpoint should be 403");
+}
+
+/// CORS 白名单（任务书 K.2）：预检白名单命中 204 + Allow-* 头，未命中 403
+/// 且不带 ACAO；普通跨域请求命中时响应带 ACAO 与 Vary: Origin。
+#[test]
+fn cors_preflight_whitelist() {
+    let Some(server) = start_server_with_args(&["--cors-origins", "http://allowed.example"]) else {
+        eprintln!("skipping: no test model available");
+        return;
+    };
+    let port = server.port;
+
+    // 白名单命中预检：204 + Allow-* 头。
+    let (status, response) = raw_request(
+        port,
+        "OPTIONS /v1/completions HTTP/1.1\r\nHost: x\r\nOrigin: http://allowed.example\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 204, "allowed preflight should be 204");
+    assert!(
+        response.contains("access-control-allow-origin: http://allowed.example"),
+        "preflight should echo allowed origin"
+    );
+    assert!(
+        response.contains("access-control-allow-methods"),
+        "preflight should list methods"
+    );
+
+    // 白名单外预检：403 且不带任何 ACAO 头。
+    let (status, response) = raw_request(
+        port,
+        "OPTIONS /v1/completions HTTP/1.1\r\nHost: x\r\nOrigin: http://evil.example\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 403, "rejected preflight should be 403");
+    assert!(
+        !response
+            .to_lowercase()
+            .contains("access-control-allow-origin"),
+        "rejected preflight must not carry ACAO"
+    );
+
+    // 白名单内普通跨域 GET：200 + ACAO + Vary。
+    let (status, response) = raw_request(
+        port,
+        "GET /v1/models HTTP/1.1\r\nHost: x\r\nOrigin: http://allowed.example\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 200, "allowed origin GET should pass");
+    assert!(response.contains("access-control-allow-origin: http://allowed.example"));
+    assert!(response.to_lowercase().contains("vary: origin"));
+}
+
 /// 资源保护（Phase 3.2）：KV 字节预算压到 0 时，任何请求都应得到 503
 /// 而不是让进程尝试分配/崩溃。
 #[test]
@@ -475,7 +647,11 @@ fn kv_budget_rejects_with_503() {
         thread::sleep(Duration::from_millis(200));
     }
 
-    let (status, text) = post(port, "/v1/completions", "{\"prompt\":\"hi\",\"max_tokens\":8}");
+    let (status, text) = post(
+        port,
+        "/v1/completions",
+        "{\"prompt\":\"hi\",\"max_tokens\":8}",
+    );
     assert_eq!(status, 503, "over-budget request must be 503: {text}");
     let err: Value = serde_json::from_str(&text).expect("error json");
     assert_eq!(err["error"]["type"], "service_unavailable");
@@ -592,8 +768,8 @@ fn graceful_shutdown_drains_accepted_sessions() {
         eprintln!("skipping: no test model available");
         return;
     };
-    let engine = qllama::server::Engine::load(Path::new(&model), None, Some(2), None)
-        .expect("load model");
+    let engine =
+        qllama::server::Engine::load(Path::new(&model), None, Some(2), None).expect("load model");
     let limits = qllama::server::Limits {
         queue_capacity: 8,
         request_timeout: Duration::from_secs(60),
@@ -623,6 +799,7 @@ fn graceful_shutdown_drains_accepted_sessions() {
                     },
                     seed: Some(42),
                     stop_texts: Vec::new(),
+                    schema: None,
                 },
                 events: tx,
                 cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

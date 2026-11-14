@@ -1,9 +1,9 @@
 # Rust
 /target/
-Cargo.lock
 
 # IDE
 .idea/
+.claude/
 .vscode/
 *.swp
 *.swo

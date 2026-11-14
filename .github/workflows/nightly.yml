@@ -1,0 +1,89 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  real-model-gated:
+    name: Real-model gated tests, soak, benchmark
+    runs-on: ubuntu-latest
+    env:
+      # 真实模型路径由仓库 secret 提供；缺失时跳过而不是失败。
+      QLLAMA_TEST_MODEL: ${{ secrets.QLLAMA_TEST_MODEL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rc-nightly
+
+      - name: Ignored tests (real-model gated)
+        run: |
+          if [ -z "${QLLAMA_TEST_MODEL}" ]; then
+            echo "QLLAMA_TEST_MODEL not set; skipping real-model gated tests"
+            exit 0
+          fi
+          cargo test --all-features -- --ignored
+
+      - name: Start server (real model)
+        if: ${{ env.QLLAMA_TEST_MODEL != '' }}
+        run: |
+          mkdir -p target/reports
+          ./target/release/qllama-server \
+            --model "${QLLAMA_TEST_MODEL}" \
+            --listen 127.0.0.1:8080 \
+            --ctx-size 2048 \
+            --kv-block-size 32 \
+            --cont-batching \
+            --audit-log target/reports/audit.jsonl \
+            > target/reports/server.stdout.log 2>&1 &
+          echo $! > target/reports/server.pid
+
+      - name: Wait for /healthz
+        if: ${{ env.QLLAMA_TEST_MODEL != '' }}
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "server healthy after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/healthz || (echo "server did not become healthy"; cat target/reports/server.stdout.log; exit 1)
+
+      - name: Soak + benchmark (real model)
+        if: ${{ env.QLLAMA_TEST_MODEL != '' }}
+        run: python scripts/bench_server.py --base-url http://127.0.0.1:8080 --concurrency 1,8,32,64
+
+      - name: Full conformance (real model, all checks)
+        if: ${{ env.QLLAMA_TEST_MODEL != '' }}
+        run: python scripts/conformance_openai.py --base-url http://127.0.0.1:8080
+
+      - name: Stop server (always)
+        if: always()
+        run: |
+          if [ -f target/reports/server.pid ]; then
+            kill "$(cat target/reports/server.pid)" 2>/dev/null || true
+            wait "$(cat target/reports/server.pid)" 2>/dev/null || true
+          fi
+          pkill -f 'qllama-server' 2>/dev/null || true
+
+      - name: Upload nightly summary
+        if: ${{ env.QLLAMA_TEST_MODEL != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qllama-nightly-reports
+          path: target/reports/
+          if-no-files-found: ignore
+          retention-days: 14
